@@ -1,0 +1,946 @@
+import Testing
+import Foundation
+@testable import ScarfCore
+
+/// M6: YAML parser port + HermesConfig loader. Pure functions — no
+/// `ServerContext.sshTransportFactory` races, so this suite can run
+/// in parallel with everything else.
+///
+/// The write-path tests for Cron editing + Settings-from-yaml live
+/// in `M5FeatureVMTests` (the serialized suite that already owns
+/// the factory-install pattern) to avoid cross-suite parallel
+/// collisions on the shared factory static.
+@Suite struct M6ConfigCronTests {
+
+    // MARK: - YAML parser
+
+    @Test func parsesScalarKeyValues() {
+        let yaml = """
+        model:
+          default: gpt-4o
+          provider: openai
+        """
+        let p = HermesYAML.parseNestedYAML(yaml)
+        #expect(p.values["model.default"] == "gpt-4o")
+        #expect(p.values["model.provider"] == "openai")
+    }
+
+    @Test func parsesBulletLists() {
+        let yaml = """
+        permanent_allowlist:
+          - ls
+          - pwd
+          - 'cat /etc/hostname'
+        """
+        let p = HermesYAML.parseNestedYAML(yaml)
+        #expect(p.lists["permanent_allowlist"] == ["ls", "pwd", "cat /etc/hostname"])
+    }
+
+    @Test func parsesNestedMaps() {
+        let yaml = """
+        terminal:
+          docker_env:
+            PATH: /usr/local/bin
+            HOME: /home/hermes
+        """
+        let p = HermesYAML.parseNestedYAML(yaml)
+        #expect(p.maps["terminal.docker_env"]?["PATH"] == "/usr/local/bin")
+        #expect(p.maps["terminal.docker_env"]?["HOME"] == "/home/hermes")
+        #expect(p.values["terminal.docker_env.PATH"] == "/usr/local/bin")
+    }
+
+    @Test func ignoresCommentsAndBlankLines() {
+        let yaml = """
+        # Top-level comment
+        model:
+          # inline comment
+          default: gpt-4o
+
+          provider: openai
+        """
+        let p = HermesYAML.parseNestedYAML(yaml)
+        #expect(p.values["model.default"] == "gpt-4o")
+        #expect(p.values["model.provider"] == "openai")
+    }
+
+    @Test func stripsQuotes() {
+        #expect(HermesYAML.stripYAMLQuotes("'quoted'") == "quoted")
+        #expect(HermesYAML.stripYAMLQuotes("\"quoted\"") == "quoted")
+        #expect(HermesYAML.stripYAMLQuotes("plain") == "plain")
+        #expect(HermesYAML.stripYAMLQuotes("'unbalanced") == "'unbalanced")
+        #expect(HermesYAML.stripYAMLQuotes("") == "")
+    }
+
+    @Test func handlesInlineLiterals() {
+        let yaml = """
+        empty_map: {}
+        empty_list: []
+        """
+        let p = HermesYAML.parseNestedYAML(yaml)
+        #expect(p.maps["empty_map"] != nil)
+        #expect(p.lists["empty_list"] != nil)
+    }
+
+    // MARK: - HermesConfig from YAML
+
+    @Test func emptyYAMLProducesDefaults() {
+        let c = HermesConfig(yaml: "")
+        #expect(c.model == "unknown")
+        #expect(c.provider == "unknown")
+        #expect(c.display.skin == "default")
+        // `display.streaming` defaults FALSE upstream and always has —
+        // `hermes_cli/config_defaults.py:796` + its reader `cli.py:2598` at
+        // v2026.9.7, and `hermes_cli/config.py:220` at v2026.3.17 (v0.3.0),
+        // the earliest tag carrying the key. This assertion pinned Scarf's
+        // own `!= "false"` bug, not Hermes's behaviour.
+        #expect(c.streaming == false)
+        #expect(c.security.redactSecrets == true)
+        #expect(c.compression.enabled == true)
+        #expect(c.voice.ttsProvider == "edge")
+        // v0.13 additions when the YAML omits them. `image_gen.model` has
+        // no upstream default (empty = "let the backend pick");
+        // `openrouter.response_cache` defaults TRUE — `config_defaults.py:649`
+        // at v2026.9.7 and `hermes_cli/config.py:686` at the key's floor tag
+        // v2026.5.7 (v0.13.0), True at every tag in between.
+        #expect(c.imageGenModel == "")
+        #expect(c.openrouterResponseCacheEnabled == true)
+    }
+
+    @Test func parsesImageGenAndOpenRouterCache() {
+        // WS-6 / v0.16: round-trip the two new top-level keys. Hermes
+        // v0.16 reads `openrouter.response_cache` as a SCALAR bool
+        // directly under `openrouter:`. This test pins the parser line +
+        // setter key + UI binding to that single shape.
+        let yaml = """
+        image_gen:
+          model: openai/gpt-image-1
+        openrouter:
+          response_cache: true
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.imageGenModel == "openai/gpt-image-1")
+        #expect(c.openrouterResponseCacheEnabled == true)
+    }
+
+    @Test func openRouterResponseCacheScalarFalseDecodes() {
+        // The scalar `false` round-trips honestly (the v0.16 bug was that
+        // a disable wrote a nested dict that Hermes read as truthy).
+        let c = HermesConfig(yaml: """
+        openrouter:
+          response_cache: false
+        """)
+        #expect(c.openrouterResponseCacheEnabled == false)
+    }
+
+    @Test func openRouterResponseCacheLegacyNestedDecodesToTheHostDefault() {
+        // Defensive read: a legacy nested value (`response_cache.enabled`, a
+        // shape no Hermes version has ever read) flattens to a different
+        // dotted key, so the scalar lookup misses and we fall to the host
+        // default — which is TRUE, and is also what Hermes itself would do
+        // with this file. The next save writes the scalar, healing the shape.
+        let c = HermesConfig(yaml: """
+        openrouter:
+          response_cache:
+            enabled: true
+        """)
+        #expect(c.openrouterResponseCacheEnabled == true)
+    }
+
+    @Test func parsesBitwardenSecretsBlock() {
+        // WS-F (v0.15): round-trip the `secrets.bitwarden.*` block. Pins
+        // the parser line + setter key shapes to a single source of truth.
+        let yaml = """
+        secrets:
+          bitwarden:
+            enabled: true
+            access_token_env: MY_BWS_TOKEN
+            project_id: proj-123
+            override_existing: true
+            server_url: https://vault.bitwarden.eu
+            cache_ttl_seconds: 600
+            auto_install: false
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.bitwarden.enabled == true)
+        #expect(c.bitwarden.accessTokenEnv == "MY_BWS_TOKEN")
+        #expect(c.bitwarden.projectID == "proj-123")
+        #expect(c.bitwarden.overrideExisting == true)
+        #expect(c.bitwarden.serverURL == "https://vault.bitwarden.eu")
+        #expect(c.bitwarden.cacheTTLSeconds == 600)
+        #expect(c.bitwarden.autoInstall == false)
+    }
+
+    @Test func bitwardenAbsentYieldsDefaults() {
+        // An absent block must produce the v0.15 server-side defaults so a
+        // pre-v0.15 host looks identical to a freshly-installed one.
+        let c = HermesConfig(yaml: "")
+        #expect(c.bitwarden.enabled == false)
+        #expect(c.bitwarden.accessTokenEnv == "BWS_ACCESS_TOKEN")
+        #expect(c.bitwarden.projectID == "")
+        // TRUE, per `config_defaults.py:2174` @ v2026.9.7 and the key's very
+        // first appearance (v2026.5.28 / v0.15.0). P20 corrected this.
+        #expect(c.bitwarden.overrideExisting == true)
+        #expect(c.bitwarden.serverURL == "")
+        #expect(c.bitwarden.cacheTTLSeconds == 300)
+        #expect(c.bitwarden.autoInstall == true)
+    }
+
+    @Test func parsesTopLevelModel() {
+        let yaml = """
+        model:
+          default: claude-4-opus
+          provider: anthropic
+        agent:
+          reasoning_effort: high
+          service_tier: pro
+          max_turns: 50
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.model == "claude-4-opus")
+        #expect(c.provider == "anthropic")
+        #expect(c.reasoningEffort == "high")
+        #expect(c.serviceTier == "pro")
+        #expect(c.maxTurns == 50)
+    }
+
+    @Test func parsesLocalEndpointModelKeys() {
+        // model.base_url / api_key / api_mode — the local/custom trio the
+        // model picker's Local tab round-trips. Absent keys must decode
+        // to "" (same as an explicitly cleared empty string).
+        let yaml = """
+        model:
+          default: llama3:8b
+          provider: ollama
+          base_url: http://127.0.0.1:11434/v1
+          api_key: sk-local
+          api_mode: chat_completions
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.modelBaseURL == "http://127.0.0.1:11434/v1")
+        #expect(c.modelAPIKey == "sk-local")
+        #expect(c.modelAPIMode == "chat_completions")
+        let absent = HermesConfig(yaml: "model:\n  default: m\n")
+        #expect(absent.modelBaseURL == "")
+        #expect(absent.modelAPIKey == "")
+        #expect(absent.modelAPIMode == "")
+    }
+
+    @Test func parsesDisplaySection() {
+        let yaml = """
+        display:
+          skin: dark
+          compact: true
+          streaming: false
+          show_reasoning: true
+          show_cost: true
+          personality: professional
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.display.skin == "dark")
+        #expect(c.display.compact == true)
+        #expect(c.streaming == false)
+        #expect(c.showReasoning == true)
+        #expect(c.showCost == true)
+        #expect(c.personality == "professional")
+    }
+
+    @Test func parsesSecuritySection() {
+        let yaml = """
+        security:
+          redact_secrets: false
+          tirith_enabled: false
+          tirith_timeout: 15
+          website_blocklist:
+            enabled: true
+            domains:
+              - example.com
+              - evil.org
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.security.redactSecrets == false)
+        #expect(c.security.tirithEnabled == false)
+        #expect(c.security.tirithTimeout == 15)
+        #expect(c.security.blocklistEnabled == true)
+        #expect(c.security.blocklistDomains == ["example.com", "evil.org"])
+    }
+
+    @Test func parsesSlackWithLegacyAndNewerPaths() {
+        // Newer path wins when both present.
+        let newerWins = HermesConfig(yaml: """
+        platforms:
+          slack:
+            reply_to_mode: all
+        slack:
+          reply_to_mode: first
+        """)
+        #expect(newerWins.slack.replyToMode == "all")
+
+        // Legacy-only path used when newer is absent.
+        let legacyFallback = HermesConfig(yaml: """
+        slack:
+          reply_to_mode: first
+        """)
+        #expect(legacyFallback.slack.replyToMode == "first")
+
+        // Default when neither present.
+        let defaulted = HermesConfig(yaml: "")
+        #expect(defaulted.slack.replyToMode == "first")
+    }
+
+    @Test func parsesAuxiliarySection() {
+        let yaml = """
+        auxiliary:
+          vision:
+            provider: openai
+            model: gpt-4-vision
+            timeout: 60
+          compression:
+            provider: anthropic
+            model: claude-3-haiku
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.auxiliary.vision.provider == "openai")
+        #expect(c.auxiliary.vision.model == "gpt-4-vision")
+        #expect(c.auxiliary.vision.timeout == 60)
+        #expect(c.auxiliary.compression.provider == "anthropic")
+        // Not-configured aux blocks default to "auto" / empty.
+        #expect(c.auxiliary.sessionSearch.provider == "auto")
+        #expect(c.auxiliary.mcp.provider == "auto")
+    }
+
+    // MARK: - P3a: title_generation, per-task reasoning_effort, approvals.smart_policy
+
+    @Test func parsesAuxiliaryReasoningEffort() {
+        let yaml = """
+        auxiliary:
+          vision:
+            provider: openai
+            reasoning_effort: high
+          compression:
+            provider: anthropic
+            reasoning_effort: none
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.auxiliary.vision.reasoningEffort == "high")
+        #expect(c.auxiliary.compression.reasoningEffort == "none")
+        // Not-configured tasks default reasoning_effort to empty
+        // ("inherit provider default"), matching Hermes's own default.
+        #expect(c.auxiliary.mcp.reasoningEffort == "")
+    }
+
+    @Test func parsesTitleGenerationBlock() {
+        let yaml = """
+        auxiliary:
+          title_generation:
+            enabled: false
+            provider: openai
+            model: gpt-4o-mini
+            base_url: https://example.test
+            api_key: sk-test
+            timeout: 45
+            reasoning_effort: minimal
+            language: ja
+        """
+        let c = HermesConfig(yaml: yaml)
+        let t = c.auxiliary.titleGeneration
+        #expect(t.enabled == false)
+        #expect(t.provider == "openai")
+        #expect(t.model == "gpt-4o-mini")
+        #expect(t.baseURL == "https://example.test")
+        #expect(t.apiKey == "sk-test")
+        #expect(t.timeout == 45)
+        #expect(t.reasoningEffort == "minimal")
+        #expect(t.language == "ja")
+    }
+
+    @Test func titleGenerationDefaultsWhenAbsent() {
+        let c = HermesConfig(yaml: "")
+        let t = c.auxiliary.titleGeneration
+        // Hermes defaults `enabled: True`, `provider: "auto"`, `timeout: 30`
+        // (hermes_cli/config_defaults.py:919-928).
+        #expect(t.enabled == true)
+        #expect(t.provider == "auto")
+        #expect(t.timeout == 30)
+        #expect(t.language == "")
+        #expect(t.reasoningEffort == "")
+    }
+
+    /// P37 finding 6: this used to pin `AuxiliaryReasoningEffort`, a second
+    /// hard-coded copy of the vocabulary. That enum is retired; the one list
+    /// is `HermesReasoningEffort`, whose `max`/`ultra` floors P35 walked
+    /// (`hermes_constants.VALID_REASONING_EFFORTS` @ v2026.7.7 / v2026.7.20).
+    @Test func auxiliaryReasoningEffortValidValues() {
+        let expected: Set<String> = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+        let target = HermesCapabilities.parseLine("Hermes Agent v0.21.1 (2026.9.7)")
+        #expect(Set(HermesReasoningEffort.levels(capabilities: target)) == expected)
+        // `parse_reasoning_effort`'s disable aliases are accepted for a
+        // hand-edited row but never offered.
+        for alias in expected.union(HermesReasoningEffort.disableAliases) {
+            #expect(HermesReasoningEffort.isValid(alias), Comment(rawValue: alias))
+        }
+    }
+
+    @Test func parsesApprovalSmartPolicy() {
+        let yaml = """
+        approvals:
+          mode: smart
+          smart_policy: "Always ESCALATE commands touching /etc"
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.approvalSmartPolicy == "Always ESCALATE commands touching /etc")
+    }
+
+    @Test func approvalSmartPolicyDefaultsToEmpty() {
+        let c = HermesConfig(yaml: "")
+        #expect(c.approvalSmartPolicy == "")
+    }
+
+    // MARK: - P3b: secrets.bitwarden.encrypted_cache, secrets.command,
+    // telemetry.shared_metrics, database.*
+
+    @Test func parsesBitwardenEncryptedCache() {
+        let yaml = """
+        secrets:
+          bitwarden:
+            enabled: true
+            encrypted_cache:
+              enabled: true
+              max_stale_seconds: 3600
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.bitwarden.encryptedCache.enabled == true)
+        #expect(c.bitwarden.encryptedCache.maxStaleSeconds == 3600)
+    }
+
+    @Test func bitwardenEncryptedCacheDefaultsWhenAbsent() {
+        let c = HermesConfig(yaml: "")
+        #expect(c.bitwarden.encryptedCache.enabled == false)
+        // 0 is a meaningful default ("no stale fallback"), not an unset
+        // sentinel — verified against config_defaults.py's encrypted_cache
+        // sub-dict.
+        #expect(c.bitwarden.encryptedCache.maxStaleSeconds == 0)
+    }
+
+    @Test func parsesCommandSecrets() {
+        let yaml = """
+        secrets:
+          command:
+            enabled: true
+            command: "cat /run/user/1000/hermes-secrets.env"
+            helper_timeout_seconds: 5
+            override_existing: true
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.commandSecrets.enabled == true)
+        #expect(c.commandSecrets.command == "cat /run/user/1000/hermes-secrets.env")
+        #expect(c.commandSecrets.helperTimeoutSeconds == 5)
+        #expect(c.commandSecrets.overrideExisting == true)
+    }
+
+    @Test func commandSecretsDefaultsWhenAbsent() {
+        let c = HermesConfig(yaml: "")
+        #expect(c.commandSecrets.enabled == false)
+        #expect(c.commandSecrets.command == "")
+        // Source-verified against agent/secret_sources/command.py's
+        // _COMMAND_TIMEOUT_SECONDS = 3.0.
+        #expect(c.commandSecrets.helperTimeoutSeconds == 3.0)
+        // Off by default, unlike Bitwarden/1Password override_existing.
+        #expect(c.commandSecrets.overrideExisting == false)
+    }
+
+    @Test func parsesSharedMetricsTelemetry() {
+        let yaml = """
+        telemetry:
+          shared_metrics:
+            enabled: true
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.telemetry.sharedMetricsEnabled == true)
+    }
+
+    @Test func sharedMetricsTelemetryDefaultsToDisabled() {
+        let c = HermesConfig(yaml: "")
+        #expect(c.telemetry.sharedMetricsEnabled == false)
+    }
+
+    @Test func parsesDatabaseSettings() {
+        let yaml = """
+        database:
+          journal_mode: delete
+          wal_autocheckpoint: 500
+          journal_size_limit: 104857600
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.database.journalMode == "delete")
+        #expect(c.database.walAutocheckpoint == 500)
+        #expect(c.database.journalSizeLimit == 104_857_600)
+    }
+
+    @Test func databaseSettingsDefaultsWhenAbsent() {
+        let c = HermesConfig(yaml: "")
+        #expect(c.database.journalMode == "wal")
+        // The empty-vs-unset hazard: absent keys must decode to nil, not
+        // 0 — 0 is a valid (if unusual) autocheckpoint/size-limit value.
+        #expect(c.database.walAutocheckpoint == nil)
+        #expect(c.database.journalSizeLimit == nil)
+    }
+
+    @Test func databaseWalAutocheckpointDistinguishesZeroFromUnset() {
+        let yaml = """
+        database:
+          wal_autocheckpoint: 0
+        """
+        let c = HermesConfig(yaml: yaml)
+        // A configured 0 must round-trip as Optional(0), not nil.
+        #expect(c.database.walAutocheckpoint == Optional(0))
+    }
+
+    /// `command_allowlist` is the only spelling Hermes reads or writes
+    /// (`tools/approval.py:327-332` and `:358-366` @ v2026.9.7); a whole-tree
+    /// grep for `permanent_allowlist` as a CONFIG key finds nothing at any of
+    /// the 32 `v2026.*` tags. P20 dropped the `permanent_allowlist` read.
+    @Test func parsesCommandAllowlist() {
+        let yaml = """
+        command_allowlist:
+          - whoami
+          - id
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.commandAllowlist == ["whoami", "id"])
+    }
+
+    /// Fails before P20: `permanent_allowlist` used to be PREFERRED, so a
+    /// config carrying both showed the list Hermes ignores.
+    @Test func permanentAllowlistIsNotAConfigKeyHermesReads() {
+        let yaml = """
+        permanent_allowlist:
+          - ls
+          - pwd
+        command_allowlist:
+          - whoami
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.commandAllowlist == ["whoami"])
+        #expect(HermesConfig(yaml: "permanent_allowlist:\n  - ls\n").commandAllowlist == [])
+    }
+
+    @Test func preservesQuotedStrings() {
+        let yaml = """
+        model:
+          default: "gpt-4o with spaces"
+        timezone: 'America/New_York'
+        """
+        let c = HermesConfig(yaml: yaml)
+        #expect(c.model == "gpt-4o with spaces")
+        #expect(c.timezone == "America/New_York")
+    }
+
+    // MARK: - v0.16 top-level <platform>.allowed_* allowlists
+
+    @Test func gatewayPlatformsEmptyByDefault() {
+        let c = HermesConfig(yaml: "")
+        #expect(c.gatewayPlatforms.isEmpty)
+    }
+
+    @Test func parsesGatewayAllowlistsForSlack() {
+        // v0.16: allowlists live at top-level `slack.allowed_*`.
+        let yaml = """
+        slack:
+          allowed_channels:
+            - C01
+            - C02
+          busy_ack_enabled: false
+          gateway_restart_notification: false
+        """
+        let cfg = HermesConfig(yaml: yaml)
+        let block = cfg.gatewayPlatforms["slack"]
+        #expect(block?.allowedChannels == ["C01", "C02"])
+        #expect(block?.busyAckEnabled == false)
+        // v0.21.1 B5: the upstream default is TRUE, so the interesting
+        // assertion is that an EXPLICIT false is honoured.
+        #expect(block?.gatewayRestartNotification == false)
+    }
+
+    @Test func parsesGatewayAllowlistsForTelegramAndMatrix() {
+        let yaml = """
+        telegram:
+          allowed_chats:
+            - '@alice'
+            - '12345'
+        matrix:
+          allowed_rooms:
+            - '!room:matrix.org'
+        """
+        let cfg = HermesConfig(yaml: yaml)
+        #expect(cfg.gatewayPlatforms["telegram"]?.allowedChats == ["@alice", "12345"])
+        #expect(cfg.gatewayPlatforms["matrix"]?.allowedRooms == ["!room:matrix.org"])
+    }
+
+    @Test func parsesGatewayAllowlistForDingtalkAsChats() {
+        // v0.16: Hermes reads `dingtalk.allowed_chats` (NOT allowed_rooms).
+        let yaml = """
+        dingtalk:
+          allowed_chats:
+            - cidABC123
+        """
+        let cfg = HermesConfig(yaml: yaml)
+        #expect(cfg.gatewayPlatforms["dingtalk"]?.allowedChats == ["cidABC123"])
+    }
+
+    @Test func gatewayAllowlistCoexistsWithLegacyPlatformKeys() {
+        // Regression: the legacy `matrix.require_mention` key lives in the
+        // SAME top-level section as the v0.16 allowlist keys — both must keep
+        // parsing, no collisions.
+        //
+        // `slack.reply_to_mode` is deliberately NOT read from the top level
+        // any more (P20): it is not a `_SHARED_KEYS` member and
+        // `merge_platform_sections` never merges a bare top-level `slack:`
+        // block, so no Hermes version has ever read it there. The nested
+        // spelling — which is what Scarf's own writer emits — is what wins.
+        let yaml = """
+        slack:
+          reply_to_mode: all
+          allowed_channels:
+            - C01
+        platforms:
+          slack:
+            reply_to_mode: first
+        matrix:
+          require_mention: false
+          allowed_rooms:
+            - '!room:matrix.org'
+        """
+        let cfg = HermesConfig(yaml: yaml)
+        #expect(cfg.slack.replyToMode == "first")
+        #expect(cfg.matrix.requireMention == false)
+        #expect(cfg.gatewayPlatforms["slack"]?.allowedChannels == ["C01"])
+        #expect(cfg.gatewayPlatforms["matrix"]?.allowedRooms == ["!room:matrix.org"])
+    }
+
+    @Test func gatewayPlatformsSkipsPlatformsWithoutGatewayKeys() {
+        // Only Slack carries a gateway key — platforms without one must NOT
+        // appear in `gatewayPlatforms`.
+        let yaml = """
+        slack:
+          busy_ack_enabled: true
+        """
+        let cfg = HermesConfig(yaml: yaml)
+        #expect(cfg.gatewayPlatforms["slack"] != nil)
+        #expect(cfg.gatewayPlatforms["mattermost"] == nil)
+        #expect(cfg.gatewayPlatforms["telegram"] == nil)
+    }
+
+    @Test func cronScheduleMemberwise() {
+        let s = CronSchedule(
+            kind: "cron",
+            runAt: nil,
+            display: "9am weekdays",
+            expression: "0 9 * * 1-5"
+        )
+        #expect(s.kind == "cron")
+        #expect(s.display == "9am weekdays")
+    }
+
+    @Test func hermesCronJobMemberwiseAndWithEnabled() {
+        let job = HermesCronJob(
+            id: "j1",
+            name: "Brief",
+            prompt: "summarize",
+            skills: ["cal"],
+            schedule: CronSchedule(kind: "cron"),
+            enabled: true,
+            state: "scheduled",
+            deliver: "discord:general",
+            workdir: "/tmp/project",
+            contextFrom: ["other-job"],
+            noAgent: true,
+            attachToSession: true,
+            extra: ["enabled_toolsets": .array([.string("files")])]
+        )
+        #expect(job.enabled)
+        let toggled = job.withEnabled(false)
+        #expect(toggled.enabled == false)
+        // Every other field round-trips — withEnabled() silently dropped
+        // workdir/contextFrom/noAgent until the v0.18 audit, permanently
+        // stripping them from jobs.json on an iOS enable-toggle.
+        #expect(toggled.id == job.id)
+        #expect(toggled.name == job.name)
+        #expect(toggled.prompt == job.prompt)
+        #expect(toggled.skills == job.skills)
+        #expect(toggled.deliver == job.deliver)
+        #expect(toggled.workdir == job.workdir)
+        #expect(toggled.contextFrom == job.contextFrom)
+        #expect(toggled.noAgent == job.noAgent)
+        #expect(toggled.attachToSession == job.attachToSession)
+        // Unknown keys survive; the disable only ADDS the pause marker.
+        #expect(toggled.extra["enabled_toolsets"] == job.extra["enabled_toolsets"])
+    }
+
+    // MARK: - v0.20.4 pause-marker gate (cron/jobs.py:571–582)
+
+    /// Enabling a paused job must clear both pause markers and land on a
+    /// runnable state, or v0.20.4's `is_job_runnable()` keeps refusing to
+    /// fire it even though the row reads enabled=true.
+    @Test func withEnabledTrueClearsPauseMarkersAndSchedules() {
+        let paused = HermesCronJob(
+            id: "j", name: "N", prompt: "p",
+            schedule: CronSchedule(kind: "cron"),
+            enabled: false,
+            state: "paused",
+            extra: [
+                "paused_at": .string("2026-08-01T10:00:00+00:00"),
+                "paused_reason": .string("operator"),
+                "monitor_script": .string("check.sh"),
+                "run_claim": .object(["by": .string("mac-studio")]),
+            ]
+        )
+        let resumed = paused.withEnabled(true)
+        #expect(resumed.enabled)
+        #expect(resumed.state == "scheduled")
+        #expect(resumed.extra["paused_at"] == nil)
+        #expect(resumed.extra["paused_reason"] == nil)
+        // Unrelated Hermes-owned keys are untouched by the resume.
+        #expect(resumed.extra["monitor_script"] == .string("check.sh"))
+        #expect(resumed.extra["run_claim"] == .object(["by": .string("mac-studio")]))
+    }
+
+    @Test func withEnabledFalseSetsPauseMarkers() {
+        let job = HermesCronJob(
+            id: "j", name: "N", prompt: "p",
+            schedule: CronSchedule(kind: "cron"),
+            enabled: true, state: "scheduled",
+            extra: ["monitor_url": .string("https://example.test/ping")]
+        )
+        let now = Date(timeIntervalSince1970: 1_785_542_400)  // 2026-08-01T00:00:00Z
+        let pausedJob = job.withEnabled(false, now: now)
+        #expect(pausedJob.enabled == false)
+        #expect(pausedJob.state == "paused")
+        #expect(pausedJob.extra["paused_at"] == .string("2026-08-01T00:00:00Z"))
+        #expect(pausedJob.extra["monitor_url"] == .string("https://example.test/ping"))
+    }
+
+    /// Disable → enable must leave the record in a firing shape with no
+    /// residual markers anywhere in the serialized JSON.
+    @Test func pauseThenResumeRoundTripsToRunnableJSON() throws {
+        let job = HermesCronJob(
+            id: "j", name: "N", prompt: "p",
+            schedule: CronSchedule(kind: "cron"),
+            enabled: true, state: "scheduled",
+            extra: ["enabled_toolsets": .array([.string("files")])]
+        )
+        let cycled = job.withEnabled(false).withEnabled(true)
+        let text = String(decoding: try JSONEncoder().encode(cycled), as: UTF8.self)
+        #expect(!text.contains("paused_at"))
+        #expect(!text.contains("paused_reason"))
+        #expect(text.contains("\"state\":\"scheduled\""))
+        #expect(text.contains("enabled_toolsets"))
+    }
+
+    /// A hand-edited jobs.json with `null` name/prompt/state must not fail
+    /// the whole-file decode (it used to take every other job down too).
+    @Test func nullRequiredStringsDecodeToDefaults() throws {
+        let json = Data("""
+        {"id":"j","name":null,"prompt":null,"state":null,
+         "schedule":{"kind":"cron"},"enabled":true}
+        """.utf8)
+        let job = try JSONDecoder().decode(HermesCronJob.self, from: json)
+        #expect(job.id == "j")
+        #expect(job.name == "")
+        #expect(job.prompt == "")
+        #expect(job.state == "")
+        // `enabled: true` + no stored state → effective_job_state's
+        // `stored or "scheduled"` fallback (cron/jobs.py:601).
+        #expect(job.effectiveState == "scheduled")
+        #expect(job.stateIcon == "clock")
+
+        // Absent keys behave the same way.
+        let sparse = Data("""
+        {"id":"j2","schedule":{"kind":"cron"},"enabled":true}
+        """.utf8)
+        let job2 = try JSONDecoder().decode(HermesCronJob.self, from: sparse)
+        #expect(job2.name == "")
+    }
+
+    /// `error` is the live terminal state Hermes persists; Scarf mapped
+    /// only the legacy `failed` spelling and fell through to a "?" icon.
+    @Test func stateIconMapsErrorAndPaused() {
+        func job(_ state: String, enabled: Bool = true) -> HermesCronJob {
+            HermesCronJob(
+                id: "j", name: "N", prompt: "p",
+                schedule: CronSchedule(kind: "cron"),
+                enabled: enabled, state: state
+            )
+        }
+        // Terminal states survive regardless of `enabled`.
+        #expect(job("error").stateIcon == "xmark.circle")
+        #expect(job("failed").stateIcon == "xmark.circle")
+        #expect(job("scheduled").stateIcon == "clock")
+        // A DISABLED job stored as paused still reads paused.
+        #expect(job("paused", enabled: false).stateIcon == "pause.circle")
+    }
+
+    /// Ported `effective_job_state` (cron/jobs.py:585-602): the scheduler
+    /// honours `enabled`, so an enabled job must never display as paused —
+    /// the 07-30 upstream outage failure mode (list looked frozen while
+    /// the fleet kept running).
+    @Test func effectiveStateNeverShowsPausedForAnEnabledJob() {
+        func job(_ state: String, enabled: Bool, pausedAt: String? = nil) -> HermesCronJob {
+            HermesCronJob(
+                id: "j", name: "N", prompt: "p",
+                schedule: CronSchedule(kind: "cron"),
+                enabled: enabled, state: state,
+                extra: pausedAt.map { ["paused_at": .string($0)] } ?? [:]
+            )
+        }
+        // enabled=true is authoritative — stale `state`/`paused_at` lose.
+        #expect(job("paused", enabled: true).effectiveState == "scheduled")
+        #expect(job("scheduled", enabled: true, pausedAt: "2026-08-20T00:00:00Z").effectiveState == "scheduled")
+        #expect(job("running", enabled: true).effectiveState == "running")
+        // Terminal states are preserved regardless of `enabled`.
+        #expect(job("completed", enabled: true).effectiveState == "completed")
+        #expect(job("error", enabled: true).effectiveState == "error")
+        #expect(job("completed", enabled: false).effectiveState == "completed")
+        // Disabled: pause marker OR stored `paused` → paused; else the
+        // stored state, falling back to "paused".
+        #expect(job("paused", enabled: false).effectiveState == "paused")
+        #expect(job("scheduled", enabled: false, pausedAt: "2026-08-20T00:00:00Z").effectiveState == "paused")
+        #expect(job("scheduled", enabled: false).effectiveState == "scheduled")
+        #expect(job("", enabled: false).effectiveState == "paused")
+        // An explicit JSON null marker is NOT a pause marker (Hermes
+        // reads it via `.get()`, so null and absent are equivalent).
+        #expect(job("scheduled", enabled: false, pausedAt: nil).effectiveState == "scheduled")
+        let nullMarker = HermesCronJob(
+            id: "j", name: "N", prompt: "p", schedule: CronSchedule(kind: "cron"),
+            enabled: false, state: "scheduled", extra: ["paused_at": .null]
+        )
+        #expect(nullMarker.effectiveState == "scheduled")
+    }
+
+    @Test func hermesCronJobAttachToSessionRoundTrip() throws {
+        // v0.18 `attach_to_session` — Hermes only persists the key when
+        // explicitly set, so nil must encode to an ABSENT key (writing
+        // false would change job behavior on save).
+        let json = Data("""
+        {"id":"j2","name":"N","prompt":"p","schedule":{"kind":"cron"},
+         "enabled":true,"state":"scheduled","attach_to_session":true}
+        """.utf8)
+        let job = try JSONDecoder().decode(HermesCronJob.self, from: json)
+        #expect(job.attachToSession == true)
+        let reencoded = try JSONDecoder().decode(
+            HermesCronJob.self, from: JSONEncoder().encode(job))
+        #expect(reencoded.attachToSession == true)
+
+        let unset = HermesCronJob(
+            id: "j3", name: "N", prompt: "p",
+            schedule: CronSchedule(kind: "cron"),
+            enabled: true, state: "scheduled"
+        )
+        let encoded = String(decoding: try JSONEncoder().encode(unset), as: UTF8.self)
+        #expect(!encoded.contains("attach_to_session"))
+    }
+
+    /// Strip null-valued keys recursively. Known optional fields decode
+    /// explicit nulls to nil and re-encode them as absent keys (Hermes
+    /// reads via .get(), so null == absent); comparison must not count
+    /// that as a diff. Unknown keys keep their nulls via `extra`.
+    private func stripNulls(_ value: Any) -> Any {
+        if let dict = value as? [String: Any] {
+            var out: [String: Any] = [:]
+            for (k, v) in dict where !(v is NSNull) {
+                out[k] = stripNulls(v)
+            }
+            return out
+        }
+        if let arr = value as? [Any] {
+            return arr.map(stripNulls)
+        }
+        return value
+    }
+
+    @Test func hermesCronJobLosslessRoundTripV0182() throws {
+        // A jobs.json entry shaped exactly like Hermes v0.18.2 persists it
+        // (cron/jobs.py create_job dict + the delta's run_claim). The
+        // v0.18.2 audit found Scarf's rewrite stripped every key it didn't
+        // model — enabled_toolsets, repeat, provider routing, claim guards —
+        // and that `pre_run_script`/`expression` were keys Hermes never
+        // wrote (real keys: `script`, `expr`, plus interval `minutes`).
+        let original = Data("""
+        {"id":"job-1","name":"Digest","prompt":"do it","skills":["daily"],
+         "skill":"daily","model":"anthropic/claude-sonnet-5","provider":"openrouter",
+         "provider_snapshot":{"provider":"openrouter","auth":"api_key"},
+         "model_snapshot":"anthropic/claude-sonnet-5","base_url":null,
+         "script":"echo pre","no_agent":false,"context_from":null,
+         "schedule":{"kind":"interval","minutes":30,"display":"every 30m"},
+         "schedule_display":"every 30m","repeat":{"times":5,"completed":2},
+         "enabled":true,"state":"scheduled","paused_at":null,"paused_reason":null,
+         "created_at":"2026-07-08T09:00:00+00:00","next_run_at":"2026-07-10T09:00:00+00:00",
+         "last_run_at":null,"last_status":null,"last_error":null,
+         "last_delivery_error":null,"deliver":"origin",
+         "origin":{"platform":"slack","chat_id":"C123"},
+         "enabled_toolsets":["files","terminal"],"workdir":"/tmp/project",
+         "attach_to_session":true,
+         "run_claim":{"at":"2026-07-10T09:00:01+00:00","by":"mac-studio"},
+         "fire_claim":null}
+        """.utf8)
+
+        let job = try JSONDecoder().decode(HermesCronJob.self, from: original)
+        // Hermes's real key for the pre-run script is `script`.
+        #expect(job.preRunScript == "echo pre")
+        #expect(job.schedule.minutes == 30)
+
+        // A plain re-encode must be lossless. (The enable/disable toggle
+        // deliberately rewrites state + pause markers — see the
+        // withEnabled tests below — so it can't stand in for this check.)
+        let reencoded = try JSONEncoder().encode(job)
+        let a = stripNulls(try JSONSerialization.jsonObject(with: original)) as! NSDictionary
+        let b = stripNulls(try JSONSerialization.jsonObject(with: reencoded)) as! NSDictionary
+        #expect(a == b)
+
+        // Explicit nulls on UNKNOWN keys survive byte-for-byte (they live
+        // in `extra`).
+        let text = String(decoding: reencoded, as: UTF8.self)
+        #expect(text.contains("\"paused_at\""))
+        #expect(text.contains("\"run_claim\""))
+        #expect(!text.contains("pre_run_script"))
+    }
+
+    @Test func cronLegacyScarfKeysDecodeButReencodeCanonical() throws {
+        // jobs.json files Scarf itself wrote through v2.15 can carry
+        // `pre_run_script` and `expression` — keys current Hermes never
+        // reads. Decode them as fallbacks, but always re-encode the
+        // canonical `script` / `expr` so the scheduler can run the job.
+        let json = Data("""
+        {"id":"j","name":"N","prompt":"p","enabled":true,"state":"scheduled",
+         "pre_run_script":"echo legacy",
+         "schedule":{"kind":"cron","expression":"0 9 * * 1-5"}}
+        """.utf8)
+        let job = try JSONDecoder().decode(HermesCronJob.self, from: json)
+        #expect(job.preRunScript == "echo legacy")
+        #expect(job.schedule.expression == "0 9 * * 1-5")
+
+        let text = String(decoding: try JSONEncoder().encode(job), as: UTF8.self)
+        #expect(text.contains("\"script\":\"echo legacy\""))
+        #expect(!text.contains("pre_run_script"))
+        #expect(text.contains("\"expr\":\"0 9 * * 1-5\""))
+        #expect(!text.contains("\"expression\""))
+    }
+
+    @Test func cronJobsFileMemberwise() throws {
+        let jobs = [
+            HermesCronJob(
+                id: "a", name: "A", prompt: "p",
+                schedule: CronSchedule(kind: "cron"),
+                enabled: true, state: "scheduled"
+            )
+        ]
+        let file = CronJobsFile(jobs: jobs, updatedAt: "2026-04-23T00:00:00Z")
+        #expect(file.jobs.count == 1)
+        #expect(file.updatedAt == "2026-04-23T00:00:00Z")
+        // Codable round-trip should survive.
+        let data = try! JSONEncoder().encode(file)
+        let decoded = try! JSONDecoder().decode(CronJobsFile.self, from: data)
+        try #require(decoded.jobs.count == 1)
+        #expect(decoded.jobs[0].name == "A")
+        #expect(decoded.updatedAt == file.updatedAt)
+    }
+}

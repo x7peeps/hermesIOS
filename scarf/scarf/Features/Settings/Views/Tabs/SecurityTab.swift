@@ -1,0 +1,186 @@
+import SwiftUI
+import ScarfCore
+import ScarfDesign
+
+/// Security tab — redaction, command allowlist (read-only), Tirith sandbox, website blocklist, human delay.
+struct SecurityTab: View {
+    @Bindable var viewModel: SettingsViewModel
+    @Environment(\.hermesCapabilities) private var capabilitiesStore
+
+    /// v0.19.1+ `hermes approvals suggest`. Pre-0.19.1 hosts render the tab
+    /// byte-identically — no section, no CLI probe.
+    private var hasApprovalsSuggest: Bool {
+        capabilitiesStore?.capabilities.hasApprovalsSuggest ?? false
+    }
+
+    /// v0.19.1+ `approvals.smart_policy`. Same floor as `hasApprovalsSuggest`
+    /// but a distinct capability flag — the two features shipped together
+    /// but are unrelated, so each gets its own name rather than one
+    /// standing in for the other.
+    private var hasApprovalSmartPolicy: Bool {
+        capabilitiesStore?.capabilities.hasApprovalSmartPolicy ?? false
+    }
+
+    var body: some View {
+        // P39c: the managed lock is per-section here, not tab-wide. Every
+        // writer below is a `config set <key>` whose managed arm prints
+        // `Cannot set configuration values: …` to stderr and returns at exit 0
+        // (`set_config_value`'s `is_managed()` arm, `hermes_cli/config.py`
+        // `:3450-3452` @ v2026.9.7). What must NOT go down with them:
+        // the two `ReadOnlyRow`s (the pinned blocklist and command allowlist —
+        // the only place the user can read what the package manager pinned)
+        // and the selectable proposal patterns in Allowlist Suggestions.
+        // `.disabled` reaches every descendant, so a tab-wide lock took those
+        // with it.
+        SettingsSection(title: "Redaction", icon: "eye.slash") {
+            ToggleRow(label: "Redact Secrets", isOn: viewModel.config.security.redactSecrets) { viewModel.setRedactSecrets($0) }
+            ToggleRow(label: "Redact PII", isOn: viewModel.config.security.redactPII) { viewModel.setRedactPII($0) }
+        }
+        .disabled(viewModel.isManagedHost)
+
+        SettingsSection(title: "Tirith Sandbox", icon: "shield.checkerboard") {
+            ToggleRow(label: "Enabled", isOn: viewModel.config.security.tirithEnabled) { viewModel.setTirithEnabled($0) }
+            EditableTextField(label: "Binary Path", value: viewModel.config.security.tirithPath) { viewModel.setTirithPath($0) }
+            StepperRow(label: "Timeout (s)", value: viewModel.config.security.tirithTimeout, range: 1...60) { viewModel.setTirithTimeout($0) }
+            ToggleRow(label: "Fail Open", isOn: viewModel.config.security.tirithFailOpen) { viewModel.setTirithFailOpen($0) }
+        }
+        .disabled(viewModel.isManagedHost)
+
+        SettingsSection(title: "Website Blocklist", icon: "xmark.shield") {
+            ToggleRow(label: "Enabled", isOn: viewModel.config.security.blocklistEnabled) { viewModel.setBlocklistEnabled($0) }
+                .disabled(viewModel.isManagedHost)
+            if !viewModel.config.security.blocklistDomains.isEmpty {
+                // A read, and the only view of what the managed layer pinned.
+                ReadOnlyRow(label: "Domains", value: viewModel.config.security.blocklistDomains.joined(separator: ", "))
+            }
+        }
+
+        if !viewModel.config.commandAllowlist.isEmpty {
+            SettingsSection(title: "Command Allowlist", icon: "checkmark.shield") {
+                ReadOnlyRow(label: "Commands", value: viewModel.config.commandAllowlist.joined(separator: ", "))
+            }
+        }
+
+        if hasApprovalSmartPolicy {
+            smartApprovalPolicySection
+        }
+        if hasApprovalsSuggest {
+            allowlistSuggestionsSection
+        }
+
+        SettingsSection(title: "Human Delay", icon: "hourglass.tophalf.filled") {
+            PickerRow(label: "Mode", selection: viewModel.config.humanDelay.mode, options: ["off", "natural", "custom"]) { viewModel.setHumanDelayMode($0) }
+            StepperRow(label: "Min (ms)", value: viewModel.config.humanDelay.minMS, range: 0...10_000, step: 50) { viewModel.setHumanDelayMinMS($0) }
+            StepperRow(label: "Max (ms)", value: viewModel.config.humanDelay.maxMS, range: 0...10_000, step: 50) { viewModel.setHumanDelayMaxMS($0) }
+        }
+        .disabled(viewModel.isManagedHost)
+    }
+
+    // MARK: - Smart approval policy (v0.20+, `approvals.smart_policy`)
+
+    /// Free-text policy appended to the smart-approval guardian's system
+    /// prompt when non-empty (e.g. "Always ESCALATE commands touching
+    /// /etc"). Paired above the Allowlist Suggestions section — both are
+    /// smart-approval-adjacent surfaces that shipped in the same Hermes
+    /// release, and the mined suggestions are more useful once the
+    /// operator has seen the free-text policy knob that shapes them.
+    private var smartApprovalPolicySection: some View {
+        SettingsSection(title: "Smart Approval Policy", icon: "text.badge.checkmark") {
+            VStack(alignment: .leading, spacing: ScarfSpace.s2) {
+                Text("Extra rules appended to the smart-approval guardian's system prompt, e.g. \"Always ESCALATE commands touching /etc\" or \"APPROVE docker compose restarts under ~/deploys\". Only used when Approval Mode is smart.")
+                    .scarfStyle(.caption)
+                    .foregroundStyle(ScarfColor.foregroundMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                EditableTextField(label: "Policy", value: viewModel.config.approvalSmartPolicy) {
+                    viewModel.setApprovalSmartPolicy($0)
+                }
+                .disabled(viewModel.isManagedHost)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(ScarfSpace.s3)
+        }
+    }
+
+    // MARK: - Allowlist suggestions (v0.20+, `hermes approvals suggest`)
+
+    /// Proposals mined from approval history. Each row carries its own
+    /// Add button — applying writes to `command_allowlist`, so it always
+    /// takes an explicit per-proposal click; there is deliberately no
+    /// "apply all".
+    private var allowlistSuggestionsSection: some View {
+        SettingsSection(title: "Allowlist Suggestions", icon: "wand.and.stars") {
+            VStack(alignment: .leading, spacing: ScarfSpace.s2) {
+                Text("Recurring commands you've approved before, mined from session history. Adding one writes it to the command allowlist so it stops prompting.")
+                    .scarfStyle(.caption)
+                    .foregroundStyle(ScarfColor.foregroundMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let msg = viewModel.approvalSuggestMessage {
+                    Text(msg)
+                        .scarfStyle(.caption)
+                        .foregroundStyle(ScarfColor.accent)
+                }
+
+                if viewModel.isLoadingApprovalSuggestions && viewModel.approvalProposals.isEmpty {
+                    Text("Mining approval history…")
+                        .scarfStyle(.caption)
+                        .foregroundStyle(ScarfColor.foregroundFaint)
+                } else if viewModel.approvalProposals.isEmpty {
+                    Text("No suggestions right now — nothing recurring has needed approval.")
+                        .scarfStyle(.caption)
+                        .foregroundStyle(ScarfColor.foregroundFaint)
+                } else {
+                    ForEach(viewModel.approvalProposals) { proposal in
+                        proposalRow(proposal)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(ScarfSpace.s3)
+        }
+        .onAppear { viewModel.loadApprovalSuggestions() }
+    }
+
+    private func proposalRow(_ proposal: HermesApprovalProposal) -> some View {
+        HStack(alignment: .top, spacing: ScarfSpace.s2) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(proposal.pattern)
+                        .font(ScarfFont.monoSmall)
+                        .foregroundStyle(ScarfColor.foregroundPrimary)
+                        .textSelection(.enabled)
+                    Text(proposal.kind)
+                        .scarfStyle(.caption)
+                        .foregroundStyle(ScarfColor.foregroundFaint)
+                }
+                Text("approved \(proposal.count)× · \(proposal.classes.joined(separator: ", "))")
+                    .scarfStyle(.caption)
+                    .foregroundStyle(ScarfColor.foregroundMuted)
+                    .lineLimit(1)
+                if let example = proposal.examples.first {
+                    Text("e.g. \(example)")
+                        .font(ScarfFont.monoSmall)
+                        .foregroundStyle(ScarfColor.foregroundFaint)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            Spacer(minLength: ScarfSpace.s2)
+            Button {
+                viewModel.applyApprovalProposal(proposal)
+            } label: {
+                if viewModel.applyingProposalN == proposal.n {
+                    Text("Adding…")
+                } else {
+                    Label("Add", systemImage: "plus")
+                }
+            }
+            // The row's ONE write: `approvals suggest --apply` rewrites
+            // `command_allowlist` in config.yaml. The pattern text above stays
+            // selectable on a managed host.
+            .disabled(viewModel.applyingProposalN != nil || viewModel.isManagedHost)
+            .help("Add \(proposal.pattern) to command_allowlist in config.yaml")
+        }
+        .padding(.vertical, 4)
+    }
+}

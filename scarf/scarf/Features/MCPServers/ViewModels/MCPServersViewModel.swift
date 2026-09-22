@@ -1,0 +1,578 @@
+import Foundation
+import ScarfCore
+
+@Observable
+final class MCPServersViewModel {
+    let context: ServerContext
+    private let fileService: HermesFileService
+
+    init(context: ServerContext = .local) {
+        self.context = context
+        self.fileService = HermesFileService(context: context)
+    }
+
+
+    var servers: [HermesMCPServer] = []
+    var selectedServerName: String?
+    var searchText = ""
+    var isLoading = false
+    var statusMessage: String?
+    var showPresetPicker = false
+    var showAddCustom = false
+    var showRestartBanner = false
+    var testResults: [String: MCPTestResult] = [:]
+    var testingNames: Set<String> = []
+    var activeError: String?
+    var editingServer: HermesMCPServer?
+    /// v0.15 — `hermes mcp catalog` discovery sheet. `showCatalog` drives the
+    /// sheet; `catalogText` holds the raw CLI text output (no `--json`);
+    /// `isLoadingCatalog` gates a spinner while the CLI runs.
+    var showCatalog = false
+    var catalogText = ""
+    var isLoadingCatalog = false
+
+    /// An add that stopped short because the server name is already taken.
+    ///
+    /// `hermes mcp add` asks "Server '<name>' already exists. Overwrite?"
+    /// **before** the auth stage, and Scarf answers its prompts positionally
+    /// on stdin — so that extra prompt used to swallow the auth answer and
+    /// shift a bearer token onto the wrong question. The overwrite decision
+    /// is therefore the user's, made here, and passed down as an explicit
+    /// `overwriteConfirmed` flag that the plan builder requires before it
+    /// will queue the extra `y`. (F9)
+    ///
+    /// `retry` re-runs the *same* add with the confirmation set.
+    struct PendingOverwrite: Identifiable {
+        let id = UUID()
+        let name: String
+        let retry: @MainActor () -> Void
+    }
+    var pendingOverwrite: PendingOverwrite?
+
+    /// A non-fatal notice from an add that SUCCEEDED but did something the
+    /// user needs to know about — today, only "your typed token was ignored
+    /// because the .env key already exists". Success-path information used
+    /// to be dropped entirely: `activeError` is only read when the add
+    /// fails. (F9)
+    var activeNotice: String?
+
+    /// Pull a leading `Note:` line out of an add's output. `HermesFileService`
+    /// prefixes one when the plan withheld a supplied token.
+    nonisolated static func addNotice(in output: String) -> String? {
+        guard let first = output.components(separatedBy: "\n").first,
+              first.hasPrefix("Note:") else { return nil }
+        return String(first.dropFirst("Note:".count)).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// True when `name` is already in the loaded server list. Advisory only:
+    /// `HermesFileService` re-checks config.yaml authoritatively and refuses
+    /// the add outright if this list was stale, so a race can never silently
+    /// overwrite.
+    func serverNameIsTaken(_ name: String) -> Bool {
+        servers.contains { $0.name == name }
+    }
+
+    var filteredServers: [HermesMCPServer] {
+        guard !searchText.isEmpty else { return servers }
+        let query = searchText.lowercased()
+        return servers.filter { server in
+            server.name.lowercased().contains(query) ||
+            server.summary.lowercased().contains(query)
+        }
+    }
+
+    var stdioServers: [HermesMCPServer] {
+        filteredServers.filter { $0.transport == .stdio }
+    }
+
+    var httpServers: [HermesMCPServer] {
+        filteredServers.filter { $0.transport == .http }
+    }
+
+    var sseServers: [HermesMCPServer] {
+        filteredServers.filter { $0.transport == .sse }
+    }
+
+    var selectedServer: HermesMCPServer? {
+        guard let name = selectedServerName else { return nil }
+        return servers.first(where: { $0.name == name })
+    }
+
+    /// `hasLoaded` lets a plain section re-entry skip the config.yaml +
+    /// mcp-tokens read (the VM is cached in `AppCoordinator` and persists
+    /// across switches); Reload and post-mutation reloads pass `force: true`
+    /// (t-aud24).
+    @ObservationIgnored private var hasLoaded = false
+
+    func load(force: Bool = false) {
+        if !force, hasLoaded || isLoading { return }
+        hasLoaded = true
+        isLoading = true
+        let svc = fileService
+        Task.detached { [weak self] in
+            // loadMCPServers reads config.yaml + lists mcp-tokens — both
+            // are sync transport calls that block on remote ssh round-trips.
+            let result = svc.loadMCPServers()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.servers = result
+                self.isLoading = false
+                if let name = self.selectedServerName, !result.contains(where: { $0.name == name }) {
+                    self.selectedServerName = nil
+                }
+            }
+        }
+    }
+
+    func selectServer(name: String?) {
+        selectedServerName = name
+    }
+
+    func beginEdit() {
+        editingServer = selectedServer
+    }
+
+    func finishEdit(reload: Bool) {
+        editingServer = nil
+        if reload {
+            // `force: true` is required, not cosmetic: `hasLoaded` is
+            // already true by the time anyone can open the editor, so a
+            // plain `load()` returns immediately and the list keeps
+            // rendering the pre-edit values until the next section switch.
+            load(force: true)
+            showRestartBanner = true
+        }
+    }
+
+    /// P40: judged by what `hermes mcp remove` PRINTED. `cmd_mcp_remove`
+    /// returns after `_lookup_server`'s `✗ Server '<name>' not found in
+    /// config.` (`hermes_cli/mcp_config.py:104`, `:518-519` @ v2026.9.7) at
+    /// exit 0, so the row flashed "Removed", vanished from the list, and came
+    /// back on the reload — the shape P31 fixed for `pairing revoke`.
+    func deleteServer(name: String) {
+        let fileService = self.fileService
+        Task.detached { [weak self] in
+            let outcome = fileService.removeMCPServer(name: name)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if outcome.succeeded {
+                    self.flashStatus("Removed \(name)")
+                    if self.selectedServerName == name {
+                        self.selectedServerName = nil
+                    }
+                    self.testResults.removeValue(forKey: name)
+                    self.load(force: true)
+                    self.showRestartBanner = true
+                } else {
+                    self.activeError = Self.removeFailureSummary(outcome: outcome)
+                }
+            }
+        }
+    }
+
+    /// Three branches, not two (the ``HermesMemoryResetVerdict/failureSummary``
+    /// shape, round-6 P54b/P59). `.unconfirmed` is gated on the CONFIDENCE
+    /// ALONE — never on whether there is a line to quote. A two-way `if`
+    /// reaches the honest sentence only when the output was EMPTY, so an
+    /// exit-0 run that printed something the verdict does not recognise had
+    /// its unrelated tail line rendered as the remove's refusal: a sentence
+    /// Hermes never said, presented as its reason.
+    static func removeFailureSummary(outcome: HermesCLIOutcome) -> String {
+        if outcome.confidence == .unconfirmed {
+            let verb = "hermes mcp remove"
+            return String(localized: "\(verb) printed no result. Check the host.")
+        }
+        // These two were never localized and stay as they were — the only
+        // NEW user-facing string here is the neutral sentence above, and it
+        // reuses the catalogue row the six sibling verbs already share.
+        if let detail = outcome.detail, !detail.isEmpty { return "Remove failed: \(detail)" }
+        return "Remove failed"
+    }
+
+    func toggleEnabled(name: String) {
+        guard let server = servers.first(where: { $0.name == name }) else { return }
+        let newValue = !server.enabled
+        let fileService = self.fileService
+        Task.detached { [weak self] in
+            let ok = fileService.toggleMCPServerEnabled(name: name, enabled: newValue)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if ok {
+                    self.flashStatus(newValue ? "Enabled \(name)" : "Disabled \(name)")
+                    self.load(force: true)
+                    self.showRestartBanner = true
+                } else {
+                    self.activeError = "Could not update \(name)"
+                }
+            }
+        }
+    }
+
+    func testServer(name: String) {
+        guard !testingNames.contains(name) else { return }
+        testingNames.insert(name)
+        let fileService = self.fileService
+        Task.detached { [weak self] in
+            let result = await fileService.testMCPServer(name: name)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.testingNames.remove(name)
+                self.testResults[name] = result
+            }
+        }
+    }
+
+    /// How many servers "Test All" probes at once. Each probe launches the
+    /// real MCP server and waits on its handshake, so serialising them made
+    /// the wall time the SUM of every server's start-up; unbounded would
+    /// launch every configured server simultaneously.
+    static let maxConcurrentTests = 4
+
+    /// Live "Test All" handle, so a run against a wedged server can be
+    /// stopped. Before F6 the loop had no cancellation at all — starting it
+    /// committed the user to every remaining probe's timeout.
+    @ObservationIgnored private var testAllTask: Task<Void, Never>?
+
+    var isTestingAll: Bool { testAllTask != nil }
+
+    func testAll() {
+        guard testAllTask == nil else { return }
+        // Skip servers already being probed individually rather than
+        // double-launching them.
+        let targets = servers.map(\.name).filter { !testingNames.contains($0) }
+        guard !targets.isEmpty else { return }
+        let fileService = self.fileService
+        // Every target enters the spinner set UP FRONT: previously `testAll`
+        // never touched `testingNames`, so the rows showed no busy state at
+        // all and results simply appeared one at a time out of nowhere.
+        for name in targets { testingNames.insert(name) }
+
+        testAllTask = Task { [weak self] in
+            await withTaskGroup(of: (String, MCPTestResult).self) { group in
+                var next = 0
+                func addTask() {
+                    let name = targets[next]
+                    next += 1
+                    group.addTask { (name, await fileService.testMCPServer(name: name)) }
+                }
+                while next < targets.count, next < Self.maxConcurrentTests { addTask() }
+                while let (name, result) = await group.next() {
+                    guard let self else { break }
+                    self.testingNames.remove(name)
+                    self.testResults[name] = result
+                    // Cancelled: stop launching more, and clear the spinner
+                    // on the ones that never ran so no row is left spinning
+                    // forever.
+                    if Task.isCancelled { break }
+                    if next < targets.count { addTask() }
+                }
+                group.cancelAll()
+            }
+            guard let self else { return }
+            for name in targets { self.testingNames.remove(name) }
+            self.testAllTask = nil
+        }
+    }
+
+    /// Stop a "Test All" in progress. Results already collected are kept —
+    /// a probe that ran and answered is information, whether or not the rest
+    /// of the sweep finished.
+    func cancelTestAll() {
+        testAllTask?.cancel()
+    }
+
+    func addFromPreset(
+        preset: MCPServerPreset,
+        name: String,
+        pathArg: String?,
+        envValues: [String: String],
+        overwriteConfirmed: Bool = false
+    ) {
+        if !overwriteConfirmed, serverNameIsTaken(name) {
+            pendingOverwrite = PendingOverwrite(name: name) { [weak self] in
+                self?.addFromPreset(
+                    preset: preset, name: name, pathArg: pathArg,
+                    envValues: envValues, overwriteConfirmed: true
+                )
+            }
+            return
+        }
+        let fileService = self.fileService
+        let allArgs: [String] = {
+            var base = preset.args
+            if let pathArg, !pathArg.isEmpty { base.append(pathArg) }
+            return base
+        }()
+        Task.detached { [weak self] in
+            let addResult: (exitCode: Int32, output: String)
+            switch preset.transport {
+            case .stdio:
+                // Env goes in at add time too: many stdio servers refuse to
+                // start (and so fail the CLI's discovery probe) without
+                // their token, and a failed probe is what used to leave the
+                // entry disabled.
+                addResult = fileService.addMCPServerStdio(
+                    name: name,
+                    command: preset.command ?? "",
+                    args: allArgs,
+                    env: envValues,
+                    overwriteConfirmed: overwriteConfirmed
+                )
+            case .http:
+                addResult = fileService.addMCPServerHTTP(
+                    name: name,
+                    url: preset.url ?? "",
+                    auth: preset.auth,
+                    overwriteConfirmed: overwriteConfirmed
+                )
+            case .sse:
+                // No SSE-transport presets ship today; the preset picker
+                // only surfaces stdio/http servers. Treat as a no-op
+                // failure if a preset somehow declares .sse.
+                addResult = (exitCode: 1, output: "SSE-transport presets are not supported.")
+            }
+            guard addResult.exitCode == 0 else {
+                await MainActor.run { [weak self] in
+                    self?.activeError = "Add failed: \(addResult.output)"
+                }
+                return
+            }
+            // Re-assert env on the saved entry: the stdio path already
+            // passed it via `--env`, but the HTTP path has no such flag.
+            if !envValues.isEmpty {
+                _ = fileService.setMCPServerEnv(name: name, env: envValues)
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.activeNotice = Self.addNotice(in: addResult.output)
+                self.flashStatus("Added \(name)")
+                self.load(force: true)
+                self.selectedServerName = name
+                self.showRestartBanner = true
+                self.showPresetPicker = false
+            }
+        }
+    }
+
+    /// Writes a catalog entry's tool defaults into the freshly-added
+    /// server, mirroring `mcp_catalog.py` at install time.
+    ///
+    /// Both halves of the manifest matter and they are mutually exclusive:
+    /// `tools.default_excluded` becomes `tools.exclude`, and
+    /// `tools.default_enabled` becomes `tools.include` — an allow-list, so
+    /// everything the server adds later stays off until the user opts in.
+    /// Scarf carried only the exclude half, so entries that ship an
+    /// allow-list (n8n, databricks, comfy, kiwi) installed with **every**
+    /// tool live, which is the opposite of what the catalog asked for.
+    nonisolated private static func applyCatalogToolDefaults(
+        fileService: HermesFileService,
+        name: String,
+        defaultEnabledTools: [String],
+        defaultExcludedTools: [String]
+    ) {
+        guard !defaultEnabledTools.isEmpty || !defaultExcludedTools.isEmpty else { return }
+        _ = fileService.updateMCPToolFilters(
+            name: name,
+            include: defaultEnabledTools,
+            exclude: defaultExcludedTools,
+            resources: true,
+            prompts: true
+        )
+    }
+
+    func addCustom(
+        name: String,
+        transport: MCPTransport,
+        command: String,
+        args: [String],
+        url: String,
+        auth: String?,
+        apiKey: String = "",
+        defaultEnabledTools: [String] = [],
+        defaultExcludedTools: [String] = [],
+        overwriteConfirmed: Bool = false
+    ) {
+        if !overwriteConfirmed, serverNameIsTaken(name) {
+            pendingOverwrite = PendingOverwrite(name: name) { [weak self] in
+                self?.addCustom(
+                    name: name, transport: transport, command: command, args: args,
+                    url: url, auth: auth, apiKey: apiKey,
+                    defaultEnabledTools: defaultEnabledTools,
+                    defaultExcludedTools: defaultExcludedTools,
+                    overwriteConfirmed: true
+                )
+            }
+            return
+        }
+        let fileService = self.fileService
+        Task.detached { [weak self] in
+            let result: (exitCode: Int32, output: String)
+            switch transport {
+            case .stdio:
+                result = fileService.addMCPServerStdio(
+                    name: name, command: command, args: args,
+                    overwriteConfirmed: overwriteConfirmed
+                )
+            case .http:
+                result = fileService.addMCPServerHTTP(
+                    name: name, url: url, auth: auth, apiKey: apiKey,
+                    overwriteConfirmed: overwriteConfirmed
+                )
+            case .sse:
+                // Routed through addCustomSSE; this branch is unreachable from
+                // the add-server form (which dispatches per-transport in submit())
+                // but kept so the switch is exhaustive without `@unknown default`.
+                result = (exitCode: 1, output: "SSE servers must be added via addCustomSSE.")
+            }
+            if result.exitCode == 0 {
+                Self.applyCatalogToolDefaults(
+                    fileService: fileService,
+                    name: name,
+                    defaultEnabledTools: defaultEnabledTools,
+                    defaultExcludedTools: defaultExcludedTools
+                )
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if result.exitCode == 0 {
+                    self.activeNotice = Self.addNotice(in: result.output)
+                    self.flashStatus("Added \(name)")
+                    self.load(force: true)
+                    self.selectedServerName = name
+                    self.showRestartBanner = true
+                    self.showAddCustom = false
+                } else {
+                    self.activeError = "Add failed: \(result.output)"
+                }
+            }
+        }
+    }
+
+    /// v0.13+ SSE-transport server creation. Caller is responsible for
+    /// capability-gating; the form filters `.sse` out of `availableTransports`
+    /// when `hasMCPSSETransport` is false, so this method is unreachable
+    /// from the UI on pre-v0.13 hosts.
+    func addCustomSSE(
+        name: String,
+        url: String,
+        auth: String? = nil,
+        apiKey: String = "",
+        defaultEnabledTools: [String] = [],
+        defaultExcludedTools: [String] = [],
+        overwriteConfirmed: Bool = false
+    ) {
+        if !overwriteConfirmed, serverNameIsTaken(name) {
+            pendingOverwrite = PendingOverwrite(name: name) { [weak self] in
+                self?.addCustomSSE(
+                    name: name, url: url,
+                    auth: auth, apiKey: apiKey,
+                    defaultEnabledTools: defaultEnabledTools,
+                    defaultExcludedTools: defaultExcludedTools,
+                    overwriteConfirmed: true
+                )
+            }
+            return
+        }
+        let fileService = self.fileService
+        Task.detached { [weak self] in
+            let result = fileService.addMCPServerSSE(
+                name: name, url: url,
+                auth: auth, apiKey: apiKey, overwriteConfirmed: overwriteConfirmed
+            )
+            if result.exitCode == 0 {
+                Self.applyCatalogToolDefaults(
+                    fileService: fileService,
+                    name: name,
+                    defaultEnabledTools: defaultEnabledTools,
+                    defaultExcludedTools: defaultExcludedTools
+                )
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if result.exitCode == 0 {
+                    self.activeNotice = Self.addNotice(in: result.output)
+                    self.flashStatus("Added \(name)")
+                    self.load(force: true)
+                    self.selectedServerName = name
+                    self.showRestartBanner = true
+                    self.showAddCustom = false
+                } else {
+                    self.activeError = "Add failed: \(result.output)"
+                }
+            }
+        }
+    }
+
+    /// v0.15 — runs `hermes mcp catalog` (text output, no `--json`) off the
+    /// MainActor and shows the raw result in a read-only sheet. Caller is
+    /// responsible for capability-gating (`HermesCapabilities.hasMCPCatalog`);
+    /// pre-v0.15 hosts reject the subcommand at argparse time.
+    func browseCatalog() {
+        showCatalog = true
+        isLoadingCatalog = true
+        catalogText = ""
+        let fileService = self.fileService
+        Task.detached { [weak self] in
+            let result = fileService.runHermesCLI(args: ["mcp", "catalog"], timeout: 45)
+            let text = result.output.isEmpty
+                ? "No catalog output. Requires Hermes v0.15+ — check that `hermes mcp catalog` runs on this host."
+                : result.output
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.catalogText = text
+                self.isLoadingCatalog = false
+            }
+        }
+    }
+
+    /// What a `gateway restart` verdict does to this pane. Three arms (P40c):
+    /// a `.unconfirmed` verdict is not an error — it goes to the neutral
+    /// status line rather than `activeError` — and it does NOT clear the
+    /// restart banner, because Scarf could not confirm the restart and the
+    /// "restart needed" prompt has therefore not earned its dismissal.
+    /// Pure and `static` so the arms can be tested without a live `hermes`.
+    enum RestartBanner: Equatable {
+        case confirmed(String)
+        case unconfirmed(String)
+        case failed(String)
+    }
+
+    static func restartBanner(_ outcome: HermesCLIOutcome) -> RestartBanner {
+        if outcome.confidence == .unconfirmed {
+            return .unconfirmed(GatewayActionBanner.unconfirmed(.restart, detail: outcome.detail))
+        }
+        if outcome.succeeded { return .confirmed("Gateway restarted") }
+        return .failed(outcome.detail.map { "Restart failed: \($0)" } ?? "Restart failed")
+    }
+
+    func restartGateway() {
+        let fileService = self.fileService
+        Task.detached { [weak self] in
+            let outcome = fileService.restartGateway()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                switch Self.restartBanner(outcome) {
+                case .confirmed(let status):
+                    self.flashStatus(status)
+                    self.showRestartBanner = false
+                case .unconfirmed(let status):
+                    self.flashStatus(status)
+                case .failed(let error):
+                    self.activeError = error
+                }
+            }
+        }
+    }
+
+    func flashStatus(_ message: String) {
+        statusMessage = message
+        Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            await MainActor.run {
+                if self.statusMessage == message {
+                    self.statusMessage = nil
+                }
+            }
+        }
+    }
+}

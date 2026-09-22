@@ -1,0 +1,381 @@
+import Testing
+import Foundation
+@testable import ScarfCore
+
+/// Exercises the Transport types + ServerContext that moved in M0b. Same
+/// contract as the M0a tests: if any `public init` drifted away from its
+/// stored properties, this suite fails fast on Linux CI before a reviewer
+/// has to build on a Mac.
+@Suite struct M0bTransportTests {
+
+    @Test func sshConfigMemberwiseAndDefaults() {
+        // Only `host` is required; all other params default to nil.
+        let minimal = SSHConfig(host: "home.local")
+        #expect(minimal.host == "home.local")
+        #expect(minimal.user == nil)
+        #expect(minimal.port == nil)
+        #expect(minimal.identityFile == nil)
+        #expect(minimal.remoteHome == nil)
+        #expect(minimal.hermesBinaryHint == nil)
+
+        let full = SSHConfig(
+            host: "h",
+            user: "u",
+            port: 2222,
+            identityFile: "/k",
+            remoteHome: "/opt/hermes",
+            hermesBinaryHint: "/usr/local/bin/hermes"
+        )
+        #expect(full.user == "u")
+        #expect(full.port == 2222)
+        #expect(full.remoteHome == "/opt/hermes")
+    }
+
+    @Test func sshConfigCodableRoundTrip() throws {
+        let src = SSHConfig(host: "h", user: "u", port: 22, identityFile: nil, remoteHome: nil, hermesBinaryHint: nil)
+        let data = try JSONEncoder().encode(src)
+        let dec = try JSONDecoder().decode(SSHConfig.self, from: data)
+        #expect(dec == src)
+    }
+
+    @Test func serverKindCases() {
+        let local = ServerKind.local
+        let ssh = ServerKind.ssh(SSHConfig(host: "h"))
+        #expect(local != ssh)
+        if case .local = local { } else { Issue.record("expected .local") }
+        if case .ssh(let cfg) = ssh { #expect(cfg.host == "h") } else { Issue.record("expected .ssh") }
+    }
+
+    @Test func serverContextLocalIsStable() {
+        // The static .local has a hard-coded UUID so window-state restoration
+        // across launches resolves. Pin that invariant.
+        #expect(ServerContext.local.id == UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        #expect(ServerContext.local.displayName == "Local")
+        #expect(ServerContext.local.isRemote == false)
+    }
+
+    @Test func serverContextPathsLocalVsRemote() {
+        // Assert the local path shape through the `.local(home:)` injection
+        // seam — the default `.local` resolves via `HermesProfileResolver`,
+        // which reads the process-wide SCARF_HERMES_HOME env var that the
+        // serialized HermesProfileResolverOverrideTests suite mutates; reading
+        // it here would race that suite under parallel execution. The
+        // env-dependent wiring is pinned deterministically in
+        // serverContextLocalPathsRouteThroughProfileResolver (that suite).
+        let injectedHome = "/tmp/scarf-unit-home/.hermes"
+        let local = ServerContext.local(home: URL(fileURLWithPath: injectedHome))
+        #expect(local.paths.isRemote == false)
+        #expect(local.paths.home == injectedHome)
+
+        let remote = ServerContext(
+            id: UUID(),
+            displayName: "remote",
+            kind: .ssh(SSHConfig(host: "h", remoteHome: "/opt/hermes"))
+        )
+        #expect(remote.isRemote == true)
+        #expect(remote.paths.home == "/opt/hermes")
+        // Default remote home when SSHConfig.remoteHome is nil:
+        let remoteDefault = ServerContext(
+            id: UUID(),
+            displayName: "r2",
+            kind: .ssh(SSHConfig(host: "h"))
+        )
+        #expect(remoteDefault.paths.home == "~/.hermes")
+    }
+
+    @Test func hermesBinaryProbablyResolvableForBareRemoteName() {
+        // #100 — a remote server with no binary hint resolves
+        // `paths.hermesBinary` to the bare command name "hermes".
+        // The pre-flight chat gate must NOT report this as missing:
+        // `fileExists("hermes")` would run `test -e hermes` in the
+        // remote cwd (a false negative), but the bare name resolves via
+        // PATH at launch. `hermesBinaryProbablyResolvable()` presumes
+        // bare names reachable and defers the real check to the ACP
+        // login-shell launch — so it returns true without any transport
+        // round-trip.
+        let remote = ServerContext(
+            id: UUID(),
+            displayName: "remote",
+            kind: .ssh(SSHConfig(host: "h", remoteHome: "/Users/Apple/.hermes"))
+        )
+        #expect(remote.paths.hermesBinary == "hermes")          // bare name
+        #expect(remote.hermesBinaryProbablyResolvable() == true) // not blocked
+    }
+
+    @Test func serverContextMakeTransportDispatchesLocal() {
+        // Only assert the .local path here. The .ssh → SSHTransport
+        // default-factory assertion lives in the serialized
+        // M5FeatureVMTests suite because it depends on
+        // `ServerContext.sshTransportFactory` being nil, which races
+        // with any other parallel test installing a custom factory.
+        let local = ServerContext.local.makeTransport()
+        #expect(local is LocalTransport)
+        #expect(local.isRemote == false)
+        #expect(local.contextID == ServerContext.local.id)
+    }
+
+    @Test func fileStatMemberwise() {
+        let s = FileStat(size: 123, mtime: Date(timeIntervalSince1970: 100), isDirectory: false)
+        #expect(s.size == 123)
+        #expect(s.mtime == Date(timeIntervalSince1970: 100))
+        #expect(s.isDirectory == false)
+    }
+
+    @Test func processResultMemberwiseAndStringAccessors() {
+        let r = ProcessResult(exitCode: 0, stdout: Data("hello\n".utf8), stderr: Data("warn\n".utf8))
+        #expect(r.exitCode == 0)
+        #expect(r.stdoutString == "hello\n")
+        #expect(r.stderrString == "warn\n")
+
+        // Non-UTF8 bytes should still return an (empty) String, never crash.
+        let weird = ProcessResult(exitCode: 1, stdout: Data([0xff, 0xfe]), stderr: Data())
+        #expect(weird.exitCode == 1)
+        #expect(weird.stdoutString == "")
+    }
+
+    @Test func watchEventHasOnlyAnyChanged() {
+        // We rely on .anyChanged as the single coalesced signal. A future
+        // addition of fine-grained cases would break consumers that pattern-
+        // match exhaustively; this test guards against that.
+        let e = WatchEvent.anyChanged
+        switch e {
+        case .anyChanged: break
+        }
+    }
+
+    @Test func localTransportConstructsWithDefaultID() {
+        let t = LocalTransport()
+        #expect(t.isRemote == false)
+        #expect(t.contextID == ServerContext.local.id)
+
+        let explicit = LocalTransport(contextID: UUID())
+        #expect(explicit.contextID != ServerContext.local.id)
+    }
+
+    /// 256 KB on each pipe — four times the 64 KB buffer, which is what makes
+    /// the deadlock reachable. What changed in round-5 P48 (t-d964ab17) is
+    /// how the bytes are produced: this used to be two `seq 1 256` loops each
+    /// calling `seq 1 1018` again, i.e. **512 shell forks**, and on a machine
+    /// running the rest of the suite in parallel those forks — not the drain —
+    /// were what consumed the 10 s ceiling. The test failed with
+    /// `.timeout(partialStdout: 102405 bytes)` for a transport that was
+    /// working. `head -c … /dev/zero | tr` is two processes per stream and
+    /// produces the same volume in milliseconds.
+    @Test func localTransportRunProcessDrainsLargeStdoutAndStderr() throws {
+        let bytes = 256 * 1024
+        let script = "head -c \(bytes) /dev/zero | tr '\\000' 'x'; "
+            + "head -c \(bytes) /dev/zero | tr '\\000' 'y' 1>&2"
+
+        let result = try LocalTransport().runProcess(
+            executable: "/bin/sh",
+            args: ["-c", script],
+            stdin: nil,
+            timeout: 10
+        )
+
+        #expect(result.exitCode == 0)
+        #expect(result.stdout.count == bytes)
+        #expect(result.stderr.count == bytes)
+    }
+
+    @Test func sshTransportStaticPathsAreStable() {
+        // controlDirPath() is used by Mac tests (`ControlPathTests`) to check
+        // the macOS 104-byte sun_path limit. Pin the format here so the
+        // per-uid suffix never drifts away.
+        let dir = SSHTransport.controlDirPath()
+        #expect(dir.hasPrefix("/tmp/scarf-ssh-"))
+
+        let id = UUID()
+        let snapshot = SSHTransport.snapshotDirPath(for: id)
+        #expect(snapshot.contains(id.uuidString))
+        #expect(snapshot.hasSuffix("/scarf/snapshots/\(id.uuidString)"))
+
+        let root = SSHTransport.snapshotRootPath()
+        #expect(root.hasSuffix("/scarf/snapshots"))
+    }
+
+    @Test func sshTransportConstructsWithConfig() {
+        let cfg = SSHConfig(host: "box.local", user: "alan")
+        let t = SSHTransport(contextID: UUID(), config: cfg, displayName: "Home")
+        #expect(t.isRemote == true)
+        #expect(t.config.host == "box.local")
+        #expect(t.displayName == "Home")
+    }
+
+    @Test func sshMakeProcessInjectsProjectCwd() {
+        let cfg = SSHConfig(host: "box.local", user: "alan")
+        let t = SSHTransport(contextID: UUID(), config: cfg, displayName: "Home")
+        // With a project cwd, the remote command must `cd` into it first so
+        // Hermes loads that project's AGENTS.md (read from the process cwd).
+        let withCwd = t.makeProcess(executable: "hermes", args: ["acp"], cwd: "/srv/Projects/news")
+        let cmd = withCwd.arguments?.last ?? ""
+        #expect(cmd.contains("cd "))
+        #expect(cmd.contains("/srv/Projects/news"))
+        #expect(cmd.contains("acp"))
+        // Without a cwd, no `cd` is injected (unchanged behavior).
+        let noCwd = t.makeProcess(executable: "hermes", args: ["acp"], cwd: nil)
+        #expect(noCwd.arguments?.last?.contains("cd ") == false)
+        // Shell-injection safety: a path containing `$(...)` must be escaped so
+        // it can't run as remote command substitution inside the double quotes.
+        let hostile = t.makeProcess(executable: "hermes", args: ["acp"], cwd: "/srv/p$(touch x)")
+        let hcmd = hostile.arguments?.last ?? ""
+        #expect(hcmd.contains("\\$("))                  // `$` escaped → substitution inert
+        #expect(!hcmd.contains("/srv/p$(touch x)"))     // never present un-escaped
+    }
+
+    /// `HERMES_HOME=` profile scoping in the composed remote command (#126):
+    /// a profile-scoped `remoteHome` must scope every remote hermes
+    /// invocation (CLI and ACP spawn), a root home must add nothing, and the
+    /// assignment must directly prefix the executable (after any `cd`).
+    /// The Mac counterpart of `CitadelServerTransport`'s #120 injection.
+    @Test func sshComposedCommandScopesHermesHomeToProfile() {
+        func transport(remoteHome: String?) -> SSHTransport {
+            SSHTransport(
+                contextID: UUID(),
+                config: SSHConfig(host: "box.local", remoteHome: remoteHome),
+                displayName: "Home"
+            )
+        }
+
+        // Profile-scoped tilde home → `$HOME`-expanded assignment before the
+        // exe (each token double-quoted by `remotePathArg`, as before).
+        let scoped = transport(remoteHome: "~/.hermes/profiles/work")
+        #expect(scoped.composedRemoteCommand(executable: "hermes", args: ["profile", "list"])
+            == "COLUMNS=400 HERMES_HOME=\"$HOME/.hermes/profiles/work\" \"hermes\" \"profile\" \"list\"")
+
+        // Profile-scoped absolute home → single-quoted, inert.
+        let docker = transport(remoteHome: "/opt/data/profiles/work")
+        #expect(docker.composedRemoteCommand(executable: "hermes", args: ["acp"])
+            == "COLUMNS=400 HERMES_HOME='/opt/data/profiles/work' \"hermes\" \"acp\"")
+
+        // Root/default homes → no assignment (legacy active_profile behavior).
+        #expect(transport(remoteHome: "~/.hermes")
+            .composedRemoteCommand(executable: "hermes", args: ["acp"]) == "COLUMNS=400 \"hermes\" \"acp\"")
+        #expect(transport(remoteHome: nil)
+            .composedRemoteCommand(executable: "hermes", args: ["acp"]) == "COLUMNS=400 \"hermes\" \"acp\"")
+
+        // A project cwd prefixes the SCOPED command — env assignment stays
+        // attached to the executable, not swallowed by the `cd`.
+        let withCwd = scoped.composedRemoteCommand(
+            executable: "hermes", args: ["acp"], cwd: "/srv/Projects/news")
+        #expect(withCwd == "cd \"/srv/Projects/news\"; COLUMNS=400 HERMES_HOME=\"$HOME/.hermes/profiles/work\" \"hermes\" \"acp\"")
+
+        // End-to-end: the ACP spawn path (`makeProcess`) carries the scope.
+        let proc = scoped.makeProcess(executable: "hermes", args: ["acp"], cwd: nil)
+        #expect(proc.arguments?.last?.contains("HERMES_HOME=") == true)
+    }
+
+    @Test func localMakeProcessSetsProjectCwdWhenPresent() {
+        let t = ServerContext.local.makeTransport()
+        let dir = NSTemporaryDirectory()
+        // Existing dir → spawned with that working directory.
+        let p1 = t.makeProcess(executable: "/bin/echo", args: ["x"], cwd: dir)
+        #expect(p1.currentDirectoryURL?.path == URL(fileURLWithPath: dir).path)
+        // A missing dir is NOT applied (graceful — setting a bad cwd would make
+        // `run()` throw). `Process.currentDirectoryURL` is never nil (it
+        // defaults to the caller's cwd), so assert it's NOT the bad path.
+        let missing = "/no/such/dir/zzz-\(UUID().uuidString)"
+        let p3 = t.makeProcess(executable: "/bin/echo", args: ["x"], cwd: missing)
+        #expect(p3.currentDirectoryURL?.path != missing)
+        // nil cwd → left at the inherited default (same as an unconfigured Process).
+        let p2 = t.makeProcess(executable: "/bin/echo", args: ["x"], cwd: nil)
+        #expect(p2.currentDirectoryURL == Process().currentDirectoryURL)
+    }
+
+    @Test func transportErrorDescriptionsAreUserFacing() {
+        #expect(TransportError.hostUnreachable(host: "h", stderr: "").errorDescription?.contains("h") == true)
+        #expect(TransportError.authenticationFailed(host: "h", stderr: "").errorDescription?.contains("authentication") == true)
+        #expect(TransportError.hostKeyMismatch(host: "h", stderr: "").errorDescription?.contains("Host key") == true)
+        #expect(TransportError.commandFailed(exitCode: 7, stderr: "no such file").errorDescription?.contains("7") == true)
+        #expect(TransportError.fileIO(path: "/p", underlying: "boom").errorDescription?.contains("/p") == true)
+        #expect(TransportError.timeout(seconds: 10, partialStdout: Data()).errorDescription?.contains("10") == true)
+        #expect(TransportError.other(message: "x").errorDescription == "x")
+    }
+
+    @Test func transportErrorClassifierHandlesKnownStderrPatterns() {
+        let auth = TransportError.classifySSHFailure(
+            host: "h", exitCode: 255,
+            stderr: "Permission denied (publickey).")
+        if case .authenticationFailed = auth {} else { Issue.record("expected authFailed") }
+
+        let mismatch = TransportError.classifySSHFailure(
+            host: "h", exitCode: 255,
+            stderr: "Host key verification failed.")
+        if case .hostKeyMismatch = mismatch {} else { Issue.record("expected hostKeyMismatch") }
+
+        let unreach = TransportError.classifySSHFailure(
+            host: "h", exitCode: 255,
+            stderr: "ssh: connect to host h port 22: Connection refused")
+        if case .hostUnreachable = unreach {} else { Issue.record("expected hostUnreachable") }
+
+        let generic = TransportError.classifySSHFailure(
+            host: "h", exitCode: 1, stderr: "random failure")
+        if case .commandFailed = generic {} else { Issue.record("expected commandFailed") }
+    }
+
+    @Test func transportErrorDiagnosticStderr() {
+        #expect(TransportError.hostUnreachable(host: "h", stderr: "detail").diagnosticStderr == "detail")
+        #expect(TransportError.timeout(seconds: 1, partialStdout: Data()).diagnosticStderr == "")
+        #expect(TransportError.other(message: "x").diagnosticStderr == "")
+    }
+
+    @Test func serverContextCachesInvalidation() async {
+        // Seed the process-wide home-cache for a made-up server, then invalidate.
+        // The .local path doesn't hit the cache (isRemote == false), so we use a
+        // remote context — its .resolvedUserHome() would do an SSH probe, which
+        // we can't run here. We just assert the invalidate API is callable.
+        let ctxID = UUID()
+        await ServerContext.invalidateCaches(for: ctxID)
+    }
+
+    @Test func localTransportFileRoundTrip() throws {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("scarftest-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let transport = LocalTransport()
+        let content = Data("hello scarf\n".utf8)
+        try transport.unguardedWriteFile(tmp.path, data: content)
+        #expect(transport.fileExists(tmp.path))
+
+        let read = try transport.readFile(tmp.path)
+        #expect(read == content)
+
+        let stat = transport.stat(tmp.path)
+        #expect(stat != nil)
+        #expect(stat?.size == Int64(content.count))
+        #expect(stat?.isDirectory == false)
+
+        try transport.removeFile(tmp.path)
+        #expect(!transport.fileExists(tmp.path))
+        // Re-remove is a no-op, not a throw.
+        try transport.removeFile(tmp.path)
+    }
+
+    /// The Mac target wires `SSHTransport.environmentEnricher` at launch to
+    /// `HermesFileService.enrichedEnvironment()` so SSH subprocesses
+    /// inherit SSH_AUTH_SOCK from the user's login shell (1Password /
+    /// Secretive / `.zshrc`-exported agents). iOS leaves it `nil` (Citadel
+    /// owns the agent). Pin the injection-point shape — a regression here
+    /// would silently break ssh-agent access for GUI-launched Scarf on
+    /// machines where `ssh-add` lives in `.zshrc` rather than `.zprofile`.
+    @Test func sshTransportEnvironmentEnricherInjection() {
+        let previous = SSHTransport.environmentEnricher
+        defer { SSHTransport.environmentEnricher = previous }
+
+        // Default (no enricher) → nothing injected.
+        SSHTransport.environmentEnricher = nil
+
+        // With enricher → its keys merged into the returned env.
+        SSHTransport.environmentEnricher = {
+            ["SSH_AUTH_SOCK": "/tmp/fake.sock", "SSH_AGENT_PID": "4242"]
+        }
+        // We can't call `sshSubprocessEnvironment()` directly (it's
+        // private). Instead assert the injection point exists + can be
+        // overridden — exercising the full dispatch path is the
+        // integration test's job, not this unit's.
+        #expect(SSHTransport.environmentEnricher != nil)
+        let sample = SSHTransport.environmentEnricher?()
+        #expect(sample?["SSH_AUTH_SOCK"] == "/tmp/fake.sock")
+        #expect(sample?["SSH_AGENT_PID"] == "4242")
+    }
+}

@@ -1,0 +1,296 @@
+import Testing
+import Foundation
+import ScarfCore
+@testable import scarf
+
+/// Coverage for session export writing to the user's Mac.
+///
+/// Pre-fix, `exportSession`/`exportAll` passed the `NSSavePanel` path
+/// straight to `hermes sessions export`. On a remote context that CLI runs
+/// on the far host over SSH, so it received a path that host doesn't have:
+/// the export failed, or landed on the remote box where the user would
+/// never find it. `runHermes` is `@discardableResult` and the result was
+/// dropped, so the user saw nothing at all — no file, no error.
+///
+/// Post-fix the CLI is asked for the payload on **stdout** (`sessions
+/// export -`) and Scarf writes those bytes to the chosen path on this Mac.
+/// One code path for local and remote, and every failure is reported.
+///
+/// The CLI is scripted through the `sessionExportRunner` seam — no
+/// subprocess, no SSH round-trip. `beginExport` gates on a real
+/// `NSSavePanel`, so these drive `performExport`, which is everything after
+/// the panel hands over a URL.
+@MainActor
+@Suite struct SessionExportRemoteDestinationTests {
+
+    /// Thread-safe recorder for the argv the export seam is handed.
+    final class ArgvRecorder: @unchecked Sendable {
+        private var calls: [[String]] = []
+        private let lock = NSLock()
+        func record(_ args: [String]) {
+            lock.lock(); defer { lock.unlock() }
+            calls.append(args)
+        }
+        var recorded: [[String]] {
+            lock.lock(); defer { lock.unlock() }
+            return calls
+        }
+    }
+
+    private static func remoteContext() -> ServerContext {
+        ServerContext(
+            id: ServerID(),
+            displayName: "build-box",
+            kind: .ssh(SSHConfig(host: "build-box", user: "jon"))
+        )
+    }
+
+    private static func tempURL() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("scarf-export-test-\(UUID().uuidString).jsonl")
+    }
+
+    /// `performExport` hands the CLI call to a detached task, so poll the
+    /// main-actor state rather than assuming it has landed.
+    private static func settle(until condition: @MainActor () -> Bool) async {
+        for _ in 0..<300 {
+            if condition() { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    @Test("Export asks the CLI for stdout rather than handing it a local path")
+    func exportRequestsStdout() async {
+        let recorder = ArgvRecorder()
+        let url = Self.tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let vm = SessionsViewModel(context: Self.remoteContext())
+        vm.sessionExportRunner = { _, args in
+            recorder.record(args)
+            return (Data(#"{"id":"abc123"}"#.utf8), "", 0)
+        }
+
+        vm.performExport(to: url, sessionId: "abc123")
+        await Self.settle(until: { vm.exportMessage != nil })
+
+        // The whole bug: the CLI must never be handed a path that only
+        // exists on this Mac. `-` means "write jsonl to stdout".
+        #expect(recorder.recorded == [[
+            "sessions", "export", "-", "--session-id", "abc123",
+        ]])
+    }
+
+    @Test("The piped bytes are written verbatim to the chosen file on this Mac")
+    func pipedBytesLandOnDisk() async {
+        let url = Self.tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let payload = "{\"id\":\"a\"}\n{\"id\":\"b\"}\n"
+
+        let vm = SessionsViewModel(context: Self.remoteContext())
+        vm.sessionExportRunner = { _, _ in (Data(payload.utf8), "", 0) }
+
+        vm.performExport(to: url, sessionId: "abc123")
+        await Self.settle(until: { vm.exportMessage != nil })
+
+        #expect(FileManager.default.fileExists(atPath: url.path))
+        let written = try? String(contentsOf: url, encoding: .utf8)
+        #expect(written == payload)
+        // Naming the size proves the file isn't the empty one a broken
+        // pipe would leave behind.
+        #expect(vm.exportMessage?.contains("Exported") == true)
+        #expect(vm.exportMessage?.contains(url.path) == true)
+    }
+
+    @Test("Export-all omits --session-id so the CLI dumps every session")
+    func exportAllOmitsSessionFilter() async {
+        let recorder = ArgvRecorder()
+        let url = Self.tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let vm = SessionsViewModel(context: Self.remoteContext())
+        vm.sessionExportRunner = { _, args in
+            recorder.record(args)
+            return (Data("{}".utf8), "", 0)
+        }
+
+        vm.performExport(to: url, sessionId: nil)
+        await Self.settle(until: { vm.exportMessage != nil })
+
+        #expect(recorder.recorded == [["sessions", "export", "-"]])
+    }
+
+    /// Hermes is Python: a crash arrives as a traceback whose *last* line
+    /// is the actual error. Reporting the first line just shows the user
+    /// "Traceback (most recent call last):" and stack frames.
+    @Test("A Python traceback is reduced to its final, meaningful line")
+    func tracebackReportsLastLine() async {
+        let url = Self.tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let traceback = """
+        Traceback (most recent call last):
+          File "/home/hermes/.hermes/hermes-agent/venv/bin/hermes", line 10, in <module>
+            sys.exit(main())
+                     ^^^^^^
+        FileNotFoundError: [Errno 2] No such file or directory: '/home/hermes/exports/a.jsonl'
+        """
+
+        let vm = SessionsViewModel(context: Self.remoteContext())
+        vm.sessionExportRunner = { _, _ in (Data(), traceback, 1) }
+
+        vm.performExport(to: url, sessionId: "abc123")
+        await Self.settle(until: { vm.exportMessage != nil })
+
+        #expect(vm.exportMessage == "Export failed: FileNotFoundError: [Errno 2] No such file or directory: '/home/hermes/exports/a.jsonl'")
+        // A failed export must not leave a truncated/empty file behind.
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+    }
+
+    /// A transport failure (or a missing local binary) returns exit -1 with
+    /// no output at all — the exact shape that made this bug invisible.
+    @Test("A silent transport failure still reports the exit code")
+    func silentFailureStillReports() async {
+        let url = Self.tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let vm = SessionsViewModel(context: Self.remoteContext())
+        vm.sessionExportRunner = { _, _ in (Data(), "", -1) }
+
+        vm.performExport(to: url, sessionId: "abc123")
+        await Self.settle(until: { vm.exportMessage != nil })
+
+        #expect(vm.exportMessage == "Export failed (exit -1).")
+    }
+
+    @Test("An unwritable destination is reported rather than swallowed")
+    func unwritableDestinationReports() async {
+        let url = URL(fileURLWithPath: "/nonexistent-dir-\(UUID().uuidString)/a.jsonl")
+
+        let vm = SessionsViewModel(context: Self.remoteContext())
+        vm.sessionExportRunner = { _, _ in (Data("{}".utf8), "", 0) }
+
+        vm.performExport(to: url, sessionId: "abc123")
+        await Self.settle(until: { vm.exportMessage != nil })
+
+        #expect(vm.exportMessage?.hasPrefix("Export failed writing a.jsonl:") == true)
+    }
+}
+
+/// Wave C2 (Hermes v0.20, t-e04cf93d): `hermes sessions export` gained
+/// `--format {jsonl,md,qmd,html,trace}` + `--redact`, gated on
+/// `HermesCapabilities.hasSessionsExportFormats`. These pin the argv the
+/// CLI seam is handed for every format/redact combination, plus the
+/// pre-0.20 path (unchanged jsonl-only shape).
+@MainActor
+@Suite struct SessionExportFormatArgvTests {
+
+    @Test("Default argv shape (jsonl, no redact) is unchanged from pre-0.20")
+    func defaultShapeUnchanged() {
+        let args = SessionsViewModel.exportArguments(output: "-", sessionId: "abc123")
+        #expect(args == ["sessions", "export", "-", "--session-id", "abc123"])
+    }
+
+    @Test("Default argv shape omits --session-id for export-all")
+    func defaultShapeOmitsSessionIdForAll() {
+        let args = SessionsViewModel.exportArguments(output: "-", sessionId: nil)
+        #expect(args == ["sessions", "export", "-"])
+    }
+
+    @Test("jsonl explicitly selected still omits --format (matches CLI default)")
+    func explicitJSONLOmitsFormatFlag() {
+        let args = SessionsViewModel.exportArguments(output: "-", sessionId: "abc123", format: .jsonl, redact: false)
+        #expect(args == ["sessions", "export", "-", "--session-id", "abc123"])
+    }
+
+    @Test("markdown format threads --format md")
+    func markdownFormat() {
+        let args = SessionsViewModel.exportArguments(output: "/tmp/exports", sessionId: nil, format: .markdown, redact: false)
+        #expect(args == ["sessions", "export", "/tmp/exports", "--format", "md"])
+    }
+
+    @Test("quarto format threads --format qmd")
+    func quartoFormat() {
+        let args = SessionsViewModel.exportArguments(output: "/tmp/exports", sessionId: nil, format: .quarto, redact: false)
+        #expect(args == ["sessions", "export", "/tmp/exports", "--format", "qmd"])
+    }
+
+    @Test("html format threads --format html")
+    func htmlFormat() {
+        let args = SessionsViewModel.exportArguments(output: "/tmp/out.html", sessionId: "abc123", format: .html, redact: false)
+        #expect(args == ["sessions", "export", "/tmp/out.html", "--format", "html", "--session-id", "abc123"])
+    }
+
+    @Test("trace format threads --format trace and supports stdout")
+    func traceFormat() {
+        let args = SessionsViewModel.exportArguments(output: "-", sessionId: "abc123", format: .trace, redact: false)
+        #expect(args == ["sessions", "export", "-", "--format", "trace", "--session-id", "abc123"])
+    }
+
+    @Test("redact appends --redact after --format, before --session-id")
+    func redactFlagOrdering() {
+        let args = SessionsViewModel.exportArguments(output: "/tmp/out.html", sessionId: "abc123", format: .html, redact: true)
+        #expect(args == ["sessions", "export", "/tmp/out.html", "--format", "html", "--redact", "--session-id", "abc123"])
+    }
+
+    @Test("redact with jsonl still omits --format but keeps --redact")
+    func redactWithJSONL() {
+        let args = SessionsViewModel.exportArguments(output: "-", sessionId: nil, format: .jsonl, redact: true)
+        #expect(args == ["sessions", "export", "-", "--redact"])
+    }
+
+    /// `trace` is the one format that inverts the flag: it redacts
+    /// unconditionally and `--no-redact` is the opt-out, while `--redact` is
+    /// read only by a closure the trace path never calls
+    /// (`hermes_cli/sessions_cmd.py:394` at v2026.9.7). This test pinned the
+    /// old `--redact` shape, which was a no-op the toggle couldn't undo — see
+    /// `AuditP25SurfaceCopyTests` for the full contract.
+    @Test("redact with trace over stdout sends nothing — trace redacts by default")
+    func redactWithTrace() {
+        let args = SessionsViewModel.exportArguments(
+            output: "-", sessionId: nil, format: .trace, redact: true,
+            traceNoRedactAvailable: true
+        )
+        #expect(args == ["sessions", "export", "-", "--format", "trace"])
+    }
+
+    @Test("redact with markdown directory output")
+    func redactWithMarkdown() {
+        let args = SessionsViewModel.exportArguments(output: "/tmp/exports", sessionId: "abc123", format: .markdown, redact: true)
+        #expect(args == ["sessions", "export", "/tmp/exports", "--format", "md", "--redact", "--session-id", "abc123"])
+    }
+
+    @Test("redact with quarto directory output")
+    func redactWithQuarto() {
+        let args = SessionsViewModel.exportArguments(output: "/tmp/exports", sessionId: "abc123", format: .quarto, redact: true)
+        #expect(args == ["sessions", "export", "/tmp/exports", "--format", "qmd", "--redact", "--session-id", "abc123"])
+    }
+
+    // MARK: - Format metadata
+
+    @Test("Only jsonl and trace are stdout-capable")
+    func stdoutCapableFormats() {
+        #expect(SessionExportFormat.jsonl.usesStdout)
+        #expect(SessionExportFormat.trace.usesStdout)
+        #expect(!SessionExportFormat.markdown.usesStdout)
+        #expect(!SessionExportFormat.quarto.usesStdout)
+        #expect(!SessionExportFormat.html.usesStdout)
+    }
+
+    @Test("Only markdown and quarto are directory outputs")
+    func directoryOutputFormats() {
+        #expect(SessionExportFormat.markdown.isDirectoryOutput)
+        #expect(SessionExportFormat.quarto.isDirectoryOutput)
+        #expect(!SessionExportFormat.jsonl.isDirectoryOutput)
+        #expect(!SessionExportFormat.html.isDirectoryOutput)
+        #expect(!SessionExportFormat.trace.isDirectoryOutput)
+    }
+
+    // NOTE: `exportSession`/`exportAll` themselves aren't exercised here —
+    // both branches of `beginExportFlow` end in a real `NSSavePanel`/
+    // `NSOpenPanel` `runModal()` call, which would block this test run
+    // waiting on a modal that never appears headlessly. The gating logic
+    // (`formatsAvailable` ? sheet : direct-to-panel) is a two-line `guard`
+    // read at the call site in `SessionsViewModel.swift`; the argv shape it
+    // ultimately produces is covered above via `exportArguments`.
+}

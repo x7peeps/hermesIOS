@@ -1,0 +1,3321 @@
+// Gated on `canImport(SQLite3)` — `RichChatViewModel` reads message
+// history from `HermesDataService`, which is SQLite-gated. iOS + macOS
+// compile this unchanged; Linux CI skips it.
+#if canImport(SQLite3)
+
+import Foundation
+import Observation
+import SwiftUI
+
+public enum ChatDisplayMode: String, CaseIterable {
+    case terminal
+    case richChat
+}
+
+public struct MessageGroup: Identifiable {
+    public let id: Int
+    public let userMessage: HermesMessage?
+    public let assistantMessages: [HermesMessage]
+    public let toolResults: [String: HermesMessage]
+
+    public var allMessages: [HermesMessage] {
+        var result: [HermesMessage] = []
+        if let user = userMessage { result.append(user) }
+        result.append(contentsOf: assistantMessages)
+        return result
+    }
+
+    public var toolCallCount: Int {
+        assistantMessages.reduce(0) { $0 + $1.toolCalls.count }
+    }
+
+    /// Assistant messages in this group carrying renderable reasoning.
+    /// Feeds the recall-mode activity marker's "· M reasoning" count.
+    public var visibleReasoningCount: Int {
+        assistantMessages.reduce(0) {
+            $0 + (($1.isAssistant && $1.hasVisibleReasoning) ? 1 : 0)
+        }
+    }
+
+    /// Aggregated `ToolKind → count` over all assistant tool calls in
+    /// this group. Lives on the model so SwiftUI's Equatable
+    /// short-circuit (issue #46) covers it — previously this was a
+    /// `MessageGroupView` computed property that re-walked O(m × k)
+    /// per group on every body re-evaluation.
+    public var toolKindCounts: [ToolKind: Int] {
+        var counts: [ToolKind: Int] = [:]
+        for msg in assistantMessages where msg.isAssistant {
+            for call in msg.toolCalls {
+                counts[call.toolKind, default: 0] += 1
+            }
+        }
+        return counts
+    }
+
+    /// Render-side coalescing of consecutive pure-text assistant
+    /// messages into a single bubble. A "pure-text" assistant has no
+    /// `toolCalls`; consecutive runs of those collapse into one
+    /// bubble so the user reads what was logically one reply as one
+    /// bubble — even when Hermes recorded it as multiple `assistant`
+    /// rows (a tool call may have run between them, or some thinking
+    /// models emit one turn as multiple messages).
+    ///
+    /// Invariants:
+    ///  - Tool-bearing assistants (any `toolCalls`) and tool-result
+    ///    rows always render as their own bubbles — they're meaningful
+    ///    boundaries, never merged.
+    ///  - The streaming bubble (`id == 0`) is never coalesced into
+    ///    its predecessors. Coalescing across the streaming boundary
+    ///    would let mid-stream `body` re-evals churn the merged
+    ///    content; keep it standalone until finalize, then the
+    ///    next render naturally folds it into the run.
+    ///  - The synthesized bubble inherits the LAST source message's
+    ///    id, timestamp, finishReason, and tokenCount so the
+    ///    metadata footer stays accurate and SwiftUI identity stays
+    ///    stable through finalize.
+    public var coalescedAssistantBubbles: [HermesMessage] {
+        var output: [HermesMessage] = []
+        var run: [HermesMessage] = []
+
+        func canCoalesce(_ msg: HermesMessage) -> Bool {
+            msg.isAssistant && msg.toolCalls.isEmpty && msg.id != 0
+        }
+
+        func flushRun() {
+            guard !run.isEmpty else { return }
+            if run.count == 1 {
+                output.append(run[0])
+            } else {
+                output.append(Self.merge(run))
+            }
+            run = []
+        }
+
+        for msg in assistantMessages {
+            if canCoalesce(msg) {
+                run.append(msg)
+            } else {
+                flushRun()
+                output.append(msg)
+            }
+        }
+        flushRun()
+        return output
+    }
+
+    /// Merge a run of pure-text assistant messages into one synthesized
+    /// `HermesMessage`. Content and reasoning channels are joined with
+    /// blank-line separators; structural fields take the last source's
+    /// values so the metadata footer reflects turn-end state.
+    private static func merge(_ run: [HermesMessage]) -> HermesMessage {
+        precondition(!run.isEmpty, "merge requires at least one message")
+        let last = run[run.count - 1]
+        let content = run.map(\.content).filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let reasoning = run
+            .compactMap(\.reasoning)
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        let reasoningContent = run
+            .compactMap(\.reasoningContent)
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        return HermesMessage(
+            id: last.id,
+            sessionId: last.sessionId,
+            role: last.role,
+            content: content,
+            toolCallId: nil,
+            toolCalls: [],
+            toolName: nil,
+            timestamp: last.timestamp,
+            tokenCount: last.tokenCount,
+            finishReason: last.finishReason,
+            reasoning: reasoning.isEmpty ? nil : reasoning,
+            reasoningContent: reasoningContent.isEmpty ? nil : reasoningContent
+        )
+    }
+
+    // MARK: - Turn activity segmentation (chat-transcript UX package, P1)
+
+    /// One renderable item in a group's assistant area: either a normal
+    /// text bubble or an aggregated run of agent *activity* (tool calls
+    /// and textless reasoning) that the view renders as a single
+    /// ActivityBubble instead of N+1 separate rows.
+    public enum ChatTranscriptItem {
+        case bubble(HermesMessage)
+        case activity(ChatActivitySegment)
+    }
+
+    /// A tool call inside an activity segment, with consecutive
+    /// IDENTICAL calls (same function name + same arguments) collapsed
+    /// into one entry carrying a repeat count (rendered as "×N").
+    public struct ChatActivityEntry: Identifiable {
+        public var id: String { call.callId }
+        public var call: HermesToolCall
+        public var count: Int
+        /// Source `HermesMessage.id` — lets the view look up per-message
+        /// context (e.g. turn durations) if it ever needs to.
+        public var sourceMessageId: Int
+    }
+
+    /// A maximal run of consecutive tool-bearing-or-textless assistant
+    /// messages, aggregated for the ActivityBubble. Presentation-only:
+    /// nothing in storage changes — the same `HermesMessage`s back it.
+    public struct ChatActivitySegment {
+        /// Collapsed tool-call entries, in emission order.
+        public let entries: [ChatActivityEntry]
+        /// Textless messages in the run that carry reasoning (the
+        /// former blank-shell "thoughts-only" bubbles fold in here).
+        public let reasoningMessages: [HermesMessage]
+        /// Count of Hermes `"(empty)"` sentinel rows in the run — the
+        /// model returned an empty response. Rendered as a muted
+        /// inline row, never a text bubble.
+        public let emptyResponseCount: Int
+        /// Total tool calls (duplicates counted), for the header count.
+        public let totalToolCount: Int
+        /// Aggregate `ToolKind → count` over the segment (duplicates
+        /// counted) — same derivation as `MessageGroup.toolKindCounts`.
+        public let toolKindCounts: [ToolKind: Int]
+        /// True when the run includes the in-flight streaming message
+        /// (id == 0) — the segment the live status attaches to.
+        public let isLive: Bool
+        /// Every source `HermesMessage.id` in the run (collapse can
+        /// drop ids from `entries`, so this is collected separately).
+        /// Lets the view look up per-turn data keyed by message id —
+        /// e.g. `turnDurations` for the settled "✓ … · 41s" header.
+        public let messageIds: [Int]
+
+        public var reasoningCount: Int { reasoningMessages.count }
+        public var latestEntry: ChatActivityEntry? { entries.last }
+        public var isEmpty: Bool {
+            entries.isEmpty && reasoningMessages.isEmpty && emptyResponseCount == 0
+        }
+    }
+
+    /// Partition this group's assistant messages into transcript items.
+    ///
+    /// Rules:
+    ///  - A message with visible text renders as a normal bubble. If it
+    ///    also carries tool calls, the text renders first (stripped of
+    ///    calls) and its calls join the activity run that follows —
+    ///    matching the actual chronology (text streamed, then the tool
+    ///    ran, then finalize packed both into one row).
+    ///  - Textless messages (tool-only, thoughts-only, or blank) join
+    ///    the current activity run; maximal runs become ONE segment.
+    ///  - Consecutive pure-text settled messages coalesce exactly like
+    ///    `coalescedAssistantBubbles` when `coalesceText` is true (the
+    ///    caller passes `!isHydratingTools` — same gate as before).
+    ///  - The streaming bubble (id == 0) is never coalesced into a
+    ///    text run.
+    public func transcriptItems(coalesceText: Bool) -> [ChatTranscriptItem] {
+        var items: [ChatTranscriptItem] = []
+        var textRun: [HermesMessage] = []
+        var activityMessages: [HermesMessage] = []
+
+        func flushTextRun() {
+            guard !textRun.isEmpty else { return }
+            if textRun.count == 1 {
+                items.append(.bubble(textRun[0]))
+            } else {
+                items.append(.bubble(Self.merge(textRun)))
+            }
+            textRun = []
+        }
+
+        func flushActivity() {
+            guard !activityMessages.isEmpty else { return }
+            defer { activityMessages = [] }
+            let segment = Self.buildActivitySegment(from: activityMessages)
+            guard !segment.isEmpty else { return }
+            items.append(.activity(segment))
+        }
+
+        for msg in assistantMessages where msg.isAssistant {
+            // The Hermes "(empty)" sentinel counts as textless: it
+            // folds into activity runs like a thoughts-only message
+            // (rendered there as a muted "empty response" row), so it
+            // can't split a tool loop or paint a "(empty)" bubble.
+            let hasText = msg.hasVisibleText
+            let hasTools = !msg.toolCalls.isEmpty
+            if hasText {
+                flushActivity()
+                if hasTools {
+                    // Text first, calls into a (new) activity run.
+                    flushTextRun()
+                    items.append(.bubble(msg.withToolCalls([])))
+                    activityMessages.append(msg.withTextRemoved())
+                } else if coalesceText, msg.id != 0 {
+                    textRun.append(msg)
+                } else {
+                    flushTextRun()
+                    items.append(.bubble(msg))
+                }
+            } else {
+                flushTextRun()
+                activityMessages.append(msg)
+            }
+        }
+        flushTextRun()
+        flushActivity()
+        return items
+    }
+
+    private static func buildActivitySegment(
+        from messages: [HermesMessage]
+    ) -> ChatActivitySegment {
+        var entries: [ChatActivityEntry] = []
+        var reasoningMessages: [HermesMessage] = []
+        var kindCounts: [ToolKind: Int] = [:]
+        var total = 0
+        var emptyResponses = 0
+        var isLive = false
+        var messageIds: [Int] = []
+
+        for msg in messages {
+            messageIds.append(msg.id)
+            if msg.id == 0 { isLive = true }
+            if msg.isEmptyResponseSentinel { emptyResponses += 1 }
+            // Visible reasoning only — a whitespace-only streamed
+            // thought chunk must not tick the header count or render
+            // a blank reasoning row.
+            if msg.hasVisibleReasoning { reasoningMessages.append(msg) }
+            for call in msg.toolCalls {
+                total += 1
+                kindCounts[call.toolKind, default: 0] += 1
+                if var last = entries.last,
+                   last.call.functionName == call.functionName,
+                   last.call.arguments == call.arguments {
+                    // Identical consecutive call → collapse, keeping the
+                    // LATEST call's identity so inspector focus and the
+                    // in-flight spinner track the most recent attempt.
+                    last.call = call
+                    last.count += 1
+                    last.sourceMessageId = msg.id
+                    entries[entries.count - 1] = last
+                } else {
+                    entries.append(ChatActivityEntry(
+                        call: call, count: 1, sourceMessageId: msg.id
+                    ))
+                }
+            }
+        }
+        return ChatActivitySegment(
+            entries: entries,
+            reasoningMessages: reasoningMessages,
+            emptyResponseCount: emptyResponses,
+            totalToolCount: total,
+            toolKindCounts: kindCounts,
+            isLive: isLive,
+            messageIds: messageIds
+        )
+    }
+}
+
+extension HermesMessage {
+    /// Copy with the visible text removed — used when a message's text
+    /// renders as its own bubble while its tool calls join an activity
+    /// segment. Reasoning stays with the text bubble (it belongs to the
+    /// visible reply, and keeping it there avoids double-rendering).
+    fileprivate func withTextRemoved() -> HermesMessage {
+        HermesMessage(
+            id: id,
+            sessionId: sessionId,
+            role: role,
+            content: "",
+            toolCallId: toolCallId,
+            toolCalls: toolCalls,
+            toolName: toolName,
+            timestamp: timestamp,
+            tokenCount: tokenCount,
+            finishReason: finishReason,
+            reasoning: nil,
+            reasoningContent: nil,
+            reasoningContentAvailable: false,
+            isCompactionSummary: isCompactionSummary,
+            containsCompactionSummary: containsCompactionSummary
+        )
+    }
+}
+
+@Observable
+public final class RichChatViewModel {
+    public let context: ServerContext
+    private let dataService: HermesDataService
+
+    public init(context: ServerContext = .local) {
+        self.context = context
+        self.dataService = HermesDataService(context: context)
+        // Quick-commands load happens in `reset()`, which every chat-start
+        // path calls before the user can interact (iOS: ChatController.start;
+        // Mac: ChatViewModel.startNewSession/resumeSession/continueLastSession).
+        // Calling it here too caused two parallel SFTP reads of config.yaml
+        // on iOS chat startup.
+    }
+
+
+    public var messages: [HermesMessage] = []
+    public var currentSession: HermesSession?
+    public var messageGroups: [MessageGroup] = []
+    /// Trailing-window cap on how many `messageGroups` the chat list
+    /// renders at once. Sits on top of `HistoryPageSize.initial` (which
+    /// bounds DB I/O): even when `messageGroups` grows past this during
+    /// a long live session, only the trailing slice materializes in the
+    /// eager `VStack`. The "Load earlier" button bumps this in
+    /// `RenderWindow.step` chunks via `extendRenderWindow()` before
+    /// falling through to the DB-paging path.
+    public var renderWindow: Int = RenderWindow.initial
+    /// Trailing slice of `messageGroups`. Critical: this windows the
+    /// existing groups array — do NOT rebuild groups from a windowed
+    /// `messages` slice or `groupIndex` will renumber and break the
+    /// `MessageGroupView.==` equatable short-circuit.
+    public var visibleGroups: [MessageGroup] {
+        guard messageGroups.count > renderWindow else { return messageGroups }
+        return Array(messageGroups.suffix(renderWindow))
+    }
+    /// True when the in-memory `messageGroups` has more entries than
+    /// the current `renderWindow` exposes — chat list shows the
+    /// "Load earlier" button and tapping it grows the window before
+    /// falling through to a DB hop.
+    public var hasHiddenInMemoryGroups: Bool { messageGroups.count > renderWindow }
+    /// Reveal another `RenderWindow.step` groups from the existing
+    /// in-memory `messageGroups`. Pure derived-property change — no
+    /// group rebuild, no I/O. Group ids stay stable so `ForEach`
+    /// prepends old groups without recreating the visible tail.
+    public func extendRenderWindow(by delta: Int = RenderWindow.step) {
+        renderWindow = min(renderWindow + delta, messageGroups.count)
+    }
+    /// True while the v2.8 two-phase loader's background hydration
+    /// (tool_calls JSON + tool result rows) is in flight. Chat header
+    /// shows "Loading tool details…" so the user knows the bare
+    /// transcript they're looking at will fill in. Cleared once both
+    /// hydration passes finish or the session-id changes underneath.
+    public var isHydratingTools: Bool = false
+    @ObservationIgnored
+    private var hydrationTask: Task<Void, Never>?
+
+    /// UserDefaults key controlling whether the chat resume path
+    /// auto-fetches the CONTENT of tool result rows (`role='tool'`) for
+    /// past messages. Defaults false — a single tool result blob
+    /// (file dump, stack trace) can be hundreds of KB; bulk-fetching
+    /// all of them during chat resume on a slow remote can blow past
+    /// the 30s SSH timeout. The Mac Settings → Display tab exposes
+    /// the toggle (mirror string in `ChatDensityKeys`).
+    public static let loadHistoricalToolResultsKey = "scarf.chat.loadHistoricalToolResults"
+    /// True from the moment the user sends a prompt until the ACP
+    /// `promptComplete` event arrives. Covers the whole round-trip
+    /// including auxiliary post-processing (title generation, usage
+    /// accounting, etc.). UIs should prefer the `isGenerating` /
+    /// `isPostProcessing` pair below — they distinguish "agent is
+    /// thinking about your message" from "agent is closing out" and
+    /// avoid the misleading "spinner after the reply has landed" UX
+    /// we saw in pass-1 (M7 #4).
+    public var isAgentWorking = false
+    /// FIFO queue of permission requests the agent has raised and the
+    /// user hasn't answered yet.
+    ///
+    /// This used to be a single slot. Hermes can raise a second
+    /// `session/request_permission` while the first is still on screen
+    /// (parallel tool calls in one turn), and the single slot silently
+    /// OVERWROTE the first — its sheet swapped contents under the
+    /// user's cursor and the overwritten request was never answered,
+    /// leaving that tool call blocked for the rest of the turn.
+    /// Queueing preserves arrival order: the UI presents the head, and
+    /// answering it pops to the next.
+    public private(set) var permissionQueue: [PendingPermission] = []
+
+    /// The request currently on screen — the head of `permissionQueue`.
+    /// Read-only on purpose: resolution goes through
+    /// `resolvePermission(requestId:)` so a stale dismissal can never
+    /// swallow a request the user hasn't seen yet.
+    public var pendingPermission: PendingPermission? { permissionQueue.first }
+
+    /// Append a request, or refresh one already queued under the same
+    /// id (a duplicate re-send from the agent must not double-queue).
+    public func enqueuePermission(_ permission: PendingPermission) {
+        if let idx = permissionQueue.firstIndex(where: { $0.requestId == permission.requestId }) {
+            permissionQueue[idx] = permission
+        } else {
+            permissionQueue.append(permission)
+        }
+    }
+
+    /// Remove an answered request. Idempotent and id-keyed: a second
+    /// call for the same id (e.g. a sheet writing its dismissal after
+    /// the answer already popped it) is a no-op rather than eating the
+    /// next queued request.
+    public func resolvePermission(requestId: Int) {
+        permissionQueue.removeAll { $0.requestId == requestId }
+    }
+
+    /// Invoked with the `requestId` of every queued permission request
+    /// that `clearPendingPermissions()` drops, so the owner can answer
+    /// the agent's still-open `session/request_permission` JSON-RPC
+    /// call with the ACP `cancelled` outcome.
+    ///
+    /// Injected rather than held as a client reference: this view model
+    /// lives in ScarfCore and has no `ACPClient` — `ChatViewModel` owns
+    /// that and wires this up. Unset (`nil`) degrades to the old
+    /// clear-only behaviour, which is what the previews, tests and the
+    /// iOS lightweight client get.
+    @ObservationIgnored
+    public var permissionCanceller: ((Int) -> Void)?
+
+    /// Drop every queued request. Used on the paths where the turn they
+    /// belong to is over (prompt complete, cancel, disconnect, session
+    /// reset) — nobody is listening for the answer any more, and
+    /// presenting a leftover on the NEXT turn would ask the user about
+    /// work that already finished.
+    ///
+    /// Dropping them from our queue is only HALF the job: each one is an
+    /// outstanding JSON-RPC request the agent is still blocked on. This
+    /// used to only `removeAll()`, so the tool call sat waiting for a
+    /// response that could never arrive — on the `handlePromptComplete`
+    /// path (the one reachable while the connection is still healthy)
+    /// that wedges the agent-side tool indefinitely. Every dropped
+    /// request is now CANCELLED first, which is the ACP-correct answer
+    /// for "the user was never asked".
+    public func clearPendingPermissions() {
+        let dropped = permissionQueue
+        permissionQueue.removeAll()
+        guard let permissionCanceller else { return }
+        for request in dropped {
+            permissionCanceller(request.requestId)
+        }
+    }
+
+    /// Mutated to trigger a scroll-to-bottom in the message list.
+    public var scrollTrigger = UUID()
+
+    /// True while the assistant hasn't yet emitted a complete reply
+    /// for the latest user prompt. Renders the prominent "Agent is
+    /// thinking…" indicator in the chat. Flips false as soon as we've
+    /// finalized an assistant message with content — even if the ACP
+    /// `promptComplete` event hasn't arrived yet (Hermes auxiliary
+    /// work like title generation delays that event).
+    public var isGenerating: Bool {
+        isAgentWorking && !isPostProcessing
+    }
+
+    /// True while ACP hasn't closed out the prompt but the assistant
+    /// has already finalized a reply the user can see. Renders a
+    /// subtle "Finishing up…" pill instead of the prominent spinner.
+    /// Avoids the pass-1 M7 #4 UX where users stared at "Agent is
+    /// working…" forever because `promptComplete` was held up by
+    /// auxiliary server-side work.
+    public var isPostProcessing: Bool {
+        guard isAgentWorking else { return false }
+        guard let last = messages.last else { return false }
+        return last.isAssistant && !last.content.isEmpty
+    }
+
+    // MARK: - Error banner state (shared macOS + iOS)
+
+    /// Human-readable error message shown in the chat's error banner.
+    /// Nil = no active error. Populated from `recordACPFailure(...)`
+    /// (throws from ACP ops) and from `handlePromptComplete` when the
+    /// response's `stopReason` is `"error"` (non-retryable provider
+    /// failures like Nous Portal HTTP 404 for an unknown model —
+    /// pass-1 M7 #2).
+    public var acpError: String?
+
+    /// Short hint derived from the error + stderr tail (e.g.
+    /// "set ANTHROPIC_API_KEY" or "pick a different model — this
+    /// one isn't in the provider's catalog"). Shown above the raw
+    /// error in the banner when present. Classified by
+    /// `ACPErrorHint.classify(errorMessage:stderrTail:)`.
+    public var acpErrorHint: String?
+
+    /// Tail of stderr captured from `hermes acp` at the time of the
+    /// failure. Shown in a collapsible "Show details" section so
+    /// users can copy-paste the raw output into a bug report.
+    public var acpErrorDetails: String?
+
+    /// Lowercase OAuth provider name (`"nous"`, `"claude"`, …) when the
+    /// most recent failure was an OAuth refresh-revocation Hermes asked
+    /// the user to fix via re-authentication. Drives the chat banner's
+    /// "Re-authenticate" button. Nil for any other failure mode.
+    public var acpErrorOAuthProvider: String?
+
+    /// Optional stderr-tail provider the controller can hook up when it
+    /// creates the ACPClient. Used by `handlePromptComplete` to enrich
+    /// the error banner on non-retryable stopReasons. The closure is
+    /// called async so callers can await `ACPClient.recentStderr`
+    /// without blocking the MainActor. Defaults to nil (no stderr in
+    /// banner, just the hint fallback).
+    public var acpStderrProvider: (@Sendable () async -> String)?
+
+    /// Clear the error triplet. Call on session reset / new chat /
+    /// successful new prompt so stale errors don't linger.
+    public func clearACPErrorState() {
+        acpError = nil
+        acpErrorHint = nil
+        acpErrorDetails = nil
+        acpErrorOAuthProvider = nil
+    }
+
+    /// Populate the error triplet from a thrown Error + the ACPClient
+    /// we can query for recent stderr. Safe to call from anywhere
+    /// that catches an ACP op failure.
+    ///
+    /// Swallows `CancellationError` silently — it's how Swift's task
+    /// tree signals cooperative cleanup (e.g. when startResuming
+    /// tears down a prior live session via stop(), the event-task
+    /// awaits throw as they unwind). That's expected plumbing, not a
+    /// user-visible failure — showing "The operation couldn't be
+    /// completed (Swift.CancellationError)" in the chat banner would
+    /// alarm users whose session actually loaded fine. Pass-2 UX fix.
+    public func recordACPFailure(_ error: Error, client: ACPClient?) async {
+        if error is CancellationError { return }
+        if (error as NSError).domain == NSURLErrorDomain, (error as NSError).code == NSURLErrorCancelled {
+            return
+        }
+        let msg = error.localizedDescription
+        let stderrTail = await client?.recentStderr ?? ""
+        let cls = ACPErrorHint.classify(errorMessage: msg, stderrTail: stderrTail)
+        acpError = msg
+        acpErrorHint = cls?.hint
+        acpErrorDetails = stderrTail.isEmpty ? nil : stderrTail
+        acpErrorOAuthProvider = cls?.oauthProvider
+    }
+
+    /// Populate the error triplet when `handlePromptComplete` sees a
+    /// non-`end_turn` stopReason (i.e. the provider rejected the
+    /// prompt and Hermes correctly surfaced it via ACP). The hint
+    /// classifier reads the stderr tail; for stopReason="error" cases
+    /// the tail typically contains the provider's HTTP status + reason.
+    public func recordPromptStopFailure(stopReason: String, client: ACPClient?) async {
+        let msg = "Prompt ended without a response (stopReason: \(stopReason))."
+        let stderrTail = await client?.recentStderr ?? ""
+        let cls = ACPErrorHint.classify(errorMessage: msg, stderrTail: stderrTail)
+        acpError = msg
+        acpErrorHint = cls?.hint ?? Self.fallbackHint(for: stopReason)
+        acpErrorDetails = stderrTail.isEmpty ? nil : stderrTail
+        acpErrorOAuthProvider = cls?.oauthProvider
+    }
+
+    /// Same as `recordPromptStopFailure` but pulls stderr from the
+    /// `acpStderrProvider` closure the controller registered. Used by
+    /// `handlePromptComplete` where we don't have direct ACPClient
+    /// access.
+    private func recordPromptStopFailureUsingProvider(stopReason: String) async {
+        let msg = "Prompt ended without a response (stopReason: \(stopReason))."
+        let stderrTail = await acpStderrProvider?() ?? ""
+        let cls = ACPErrorHint.classify(errorMessage: msg, stderrTail: stderrTail)
+        acpError = msg
+        acpErrorHint = cls?.hint ?? Self.fallbackHint(for: stopReason)
+        acpErrorDetails = stderrTail.isEmpty ? nil : stderrTail
+        acpErrorOAuthProvider = cls?.oauthProvider
+    }
+
+    private static func fallbackHint(for stopReason: String) -> String? {
+        switch stopReason {
+        case "error":    return "The provider returned an error. Check the details below — often the configured model isn't in the provider's catalog."
+        case "refusal":  return "The session may have been cleared on the server. Start a new chat to continue."
+        case "max_tokens": return "The response was cut off before any content was produced. Try a shorter prompt or raise the max-tokens limit in Settings."
+        default: return nil
+        }
+    }
+
+    // Cumulative ACP token tracking, accumulated from each prompt result.
+    //
+    // Since Hermes v2026.7.1 state.db DOES carry ACP token counts — the ACP
+    // path runs through the same `queue_token_counts` chokepoint as the CLI
+    // (`agent/turn_usage.py` → `hermes_state_usage.py`), so `SessionInfoBar`
+    // prefers the DB value whenever it is non-zero. This accumulator stays
+    // for the two cases the DB cannot cover: MID-TURN display (state.db is
+    // only written at turn boundaries) and pre-v2026.7.1 hosts, where the
+    // ACP rows really were zero.
+    public private(set) var acpInputTokens = 0
+    public private(set) var acpOutputTokens = 0
+    public private(set) var acpThoughtTokens = 0
+    public private(set) var acpCachedReadTokens = 0
+    /// Running count of context compactions Hermes has performed on this
+    /// session. Surfaced as the `🗜 ×N` chip in `SessionInfoBar` when > 0
+    /// and `HermesCapabilities.hasContextCompressionCount` is true.
+    ///
+    /// **Always 0 over ACP today** — no Hermes tag puts a compression count
+    /// in the `session/prompt` usage payload (`acp_adapter/server.py:325-336`
+    /// @ v2026.3.30, `:917-924` @ v2026.9.7), so the chip never fires. The
+    /// plumbing is kept for a future field: each response would carry the
+    /// latest server-side total, so we replace (with a `max` guard) rather
+    /// than accumulate.
+    public private(set) var acpCompressionCount = 0
+
+    /// Slash commands advertised by the ACP server via `available_commands_update`.
+    public private(set) var acpCommands: [HermesSlashCommand] = []
+    /// User-defined commands parsed from `config.yaml` `quick_commands`.
+    public private(set) var quickCommands: [HermesSlashCommand] = []
+    /// Project-scoped, Scarf-managed commands at
+    /// `<project>/.scarf/slash-commands/<name>.md`. Loaded by
+    /// `loadProjectScopedCommands(at:)` when a project chat starts; cleared
+    /// on `reset()`. The full `ProjectSlashCommand` payload is kept here
+    /// (not just the surface metadata) because expansion happens in
+    /// `ChatViewModel.sendPrompt` and needs the body + model override.
+    public private(set) var projectScopedCommands: [ProjectSlashCommand] = []
+
+    /// Global Scarf-managed commands at `~/.hermes/scarf/slash-commands/<name>.md`.
+    /// Populated from `BuiltinSlashCommands.bundle` on app launch by
+    /// `SlashCommandBootstrapService` and refreshed on each session start
+    /// via `loadGlobalScopedCommands()`. Available in EVERY chat (pre-
+    /// session, global, project-scoped), not just project chats — that's
+    /// the whole point of the global vs. project-scoped split. Per-project
+    /// commands of the same name win over global via `availableCommands`'
+    /// dedup logic.
+    public private(set) var globalScopedCommands: [ProjectSlashCommand] = []
+
+    /// The ACP-native commands that don't interrupt the current turn:
+    /// `/steer` (apply guidance after the next tool call without aborting)
+    /// and `/queue` (run a prompt after the current turn finishes).
+    ///
+    /// **Floor v0.13 (`v2026.5.7`), not v2026.4.23.** Both names enter
+    /// `HermesACPAgent._SLASH_COMMANDS` together — the dict is
+    /// `acp_adapter/server.py:163-173` @ `v2026.5.7`, `steer` at `:170` and
+    /// `queue` at `:171` — and `acp_adapter/` at `v2026.4.30` has neither.
+    /// (At `v2026.9.7` the roster has moved to `acp_adapter/commands.py`,
+    /// `steer` at `:55` and `queue` at `:60`; the FLOOR is what this line
+    /// is about, so it cites the tag the names arrived at.) The gates are ``HermesCapabilities
+    /// .hasACPSteer`` and ``HermesCapabilities.hasACPQueue``, applied in
+    /// `availableCommands` — this list is unfiltered.
+    ///
+    /// **They do not "no-op gracefully" below the floor.** An ACP name the
+    /// adapter does not know is not an error: `_handle_slash` returns `None`
+    /// and the raw text falls through to the LLM as a prompt
+    /// (`acp_adapter/commands.py:88-95` @ `v2026.9.7`). A dead row therefore
+    /// burns a turn asking the model about "/steer", which is why the
+    /// capability gate is load-bearing rather than cosmetic.
+    ///
+    /// `/goal` and `/subgoal` are deliberately NOT here — and since P55
+    /// neither is their optimistic mirror; see
+    /// ``acpUnhandledSlashNotice(name:)``.
+    // NOTE: `/goal` and `/subgoal` are NOT advertised here. The ACP
+    // adapter's `_COMMANDS` table has never carried either name at ANY
+    // tag (`acp_adapter/commands.py:44-66` @ `v2026.9.7`;
+    // `acp_adapter/server.py:163-173` @ `v2026.5.7`), so over ACP the text
+    // falls through to the model as an ordinary prompt (`commands.py:94-95`).
+    public static let nonInterruptiveCommands: [HermesSlashCommand] = [
+        HermesSlashCommand(
+            name: "steer",
+            description: "Nudge the agent mid-run (applies after the next tool call)",
+            argumentHint: "<guidance>",
+            source: .acpNonInterruptive
+        ),
+        HermesSlashCommand(
+            name: "queue",
+            description: "Queue a prompt to run after the current turn",
+            argumentHint: "<text>",
+            source: .acpNonInterruptive
+        )
+    ]
+
+    /// The slash command name that compresses the conversation on THIS host,
+    /// without a leading slash: `"compress"` at/above v0.19.1, `"compact"`
+    /// below it (and on an undetected host).
+    ///
+    /// Scarf's chat composer speaks ACP, and the ACP adapter renamed the
+    /// command mid-window with no alias in either direction — so sending the
+    /// other spelling does not error, it falls through to the LLM and burns a
+    /// turn. See ``HermesCapabilities/hasACPCompressSpelling`` for the
+    /// per-tag evidence.
+    public static func compressSlashName(capabilities: HermesCapabilities) -> String {
+        capabilities.hasACPCompressSpelling ? "compress" : "compact"
+    }
+
+    /// The full text the compress gesture sends, focus topic optional —
+    /// `/compress`, `/compact`, or either with a trailing focus topic.
+    public static func compressSlashCommand(
+        capabilities: HermesCapabilities,
+        focus: String = ""
+    ) -> String {
+        let name = compressSlashName(capabilities: capabilities)
+        let trimmed = focus.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "/\(name)" : "/\(name) \(trimmed)"
+    }
+
+    /// Static fallback commands Hermes ACP always supports but only
+    /// advertises via `available_commands_update` after `session/new` —
+    /// not after `session/load`. Without this fallback, resumed sessions
+    /// (and "no active session" cold starts) showed an artificially
+    /// sparse menu. With this list, the menu is discoverable everywhere;
+    /// when the ACP-advertised version arrives, dedupe-by-name in
+    /// `availableCommands` ensures the canonical (richer description,
+    /// authoritative argument hint) entry wins.
+    ///
+    /// The roster is the ACP adapter's own surface and nothing else — P34
+    /// walked `acp_adapter/` across every `v2026.*` tag that ships one
+    /// (v2026.3.17 / 0.3.0 is the first; v2026.3.12 / 0.2.0 has no adapter):
+    /// `help model tools context reset compact|compress steer queue version`
+    /// and never anything more. `_SLASH_COMMANDS` at
+    /// `acp_adapter/server.py:453-463` @ v2026.7.20 becomes
+    /// `SlashCommandsMixin._COMMANDS` at `acp_adapter/commands.py:44-66`
+    /// @ v2026.9.7, with `_available_commands()` (`:69-74`) advertising
+    /// exactly those. An unknown name is not an error — it returns `None`
+    /// and the text falls through to the LLM (`commands.py:88-95`), so a
+    /// dead row silently burns a turn.
+    ///
+    /// The set does NOT split on whether a session is active — it used to,
+    /// and the doc described that split long after P2 of the projects fix
+    /// removed it. Every row below is returned in both states; the
+    /// session-only ones are surfaced ALWAYS and greyed PRE-SESSION, because
+    /// the chat view hands the menu `disabledCommandNames` from
+    /// ``sessionRequiredCommandNames``. Hiding them outright made the menu
+    /// look broken on a fresh launch. (The `hasActiveSession` parameter this
+    /// function used to take was never read; it is gone.)
+    ///
+    /// - **`/new`**: it is
+    ///   CLIENT-SIDE — `clientSideSlashCommand(for:)` intercepts it before
+    ///   the wire (the adapter has never had a `new`); it's the "open a
+    ///   session" affordance and arms the v0.13+ `[<name>]` argument hint
+    ///   via `hasNewWithSessionName`.
+    /// - **Session-REQUIRING**, all sent to the transport verbatim and
+    ///   all dispatched by the adapter on every supported host (they are in
+    ///   `_SLASH_COMMANDS` from v2026.3.17, below Scarf's v0.6.0 floor, so
+    ///   no capability flag applies): `/help`, `/model`, `/tools`,
+    ///   `/context`, `/reset`, the version-appropriate
+    ///   `/compact`-or-`/compress` (see ``compressSlashName(capabilities:)``),
+    ///   `/version`. Each needs a live session, which is what
+    ///   ``sessionRequiredCommandNames`` greys out — not what this function
+    ///   filters.
+    ///
+    /// Deliberately NOT here (P34): `clear`, `cost`, `reload-skills`,
+    /// `exit`, `yolo`, `sessions`, `codex-runtime`. None is an ACP name at
+    /// any tag. `cost` has never existed anywhere (the CLI verb is `usage`,
+    /// `hermes_cli/commands.py:277` @ v2026.9.7); `clear` (`:58`) and
+    /// `exit` (`:302-303`, an alias of `quit`) are `cli_only` terminal
+    /// commands; `reload-skills` (`:259-260`), `sessions` (`:148`),
+    /// `codex-runtime` (`:156-158`) and `yolo` (`:181`) are CLI/gateway
+    /// CommandDefs the ACP adapter does not wire. `/reset` ("Clear
+    /// conversation history") is the ACP replacement for the `/clear`
+    /// gesture users knew.
+    public static func alwaysAvailableCommands(
+        capabilities: HermesCapabilities
+    ) -> [HermesSlashCommand] {
+        var result: [HermesSlashCommand] = [
+            HermesSlashCommand(
+                name: "new",
+                description: "Start a new chat session",
+                argumentHint: capabilities.hasNewWithSessionName ? "[<name>]" : nil,
+                source: .alwaysAvailable
+            )
+        ]
+        // P2 of the projects-feature fix: pre-session, surface the agent
+        // commands too — greyed out in the menu (the chat view supplies
+        // `disabledCommandNames` from `sessionRequiredCommandNames`) so the
+        // user sees what's available once they open a chat instead of an
+        // apparently-empty menu. Hiding them entirely made the menu look
+        // broken on fresh app launches.
+        result.append(contentsOf: [
+            HermesSlashCommand(
+                name: "help",
+                description: "Show available commands",
+                argumentHint: nil,
+                source: .alwaysAvailable
+            ),
+            HermesSlashCommand(
+                name: "model",
+                description: "Switch the active model",
+                argumentHint: "[<model>]",
+                source: .alwaysAvailable
+            ),
+            HermesSlashCommand(
+                name: "tools",
+                description: "Manage tool availability",
+                argumentHint: nil,
+                source: .alwaysAvailable
+            ),
+            HermesSlashCommand(
+                name: "context",
+                description: "Show conversation message counts by role",
+                argumentHint: nil,
+                source: .alwaysAvailable
+            ),
+            HermesSlashCommand(
+                name: "reset",
+                description: "Clear conversation history",
+                argumentHint: nil,
+                source: .alwaysAvailable
+            ),
+            // The SPELLING is version-dependent, and the table that decides
+            // it is the ACP adapter's — not `hermes_cli/commands.py`, which
+            // the chat composer never talks to. ACP's `_SLASH_COMMANDS` says
+            // `compact` through v2026.7.20 (0.19.0) and `compress` from
+            // v2026.7.30 (0.19.1), with no alias either way, so the wrong
+            // spelling falls through to the LLM and nothing compresses. See
+            // ``HermesCapabilities/hasACPCompressSpelling`` for the 32-tag
+            // walk; on a v0.12 host the TUI's unrelated `/compact` display
+            // toggle (`tui_gateway/server.py:3846` `_TUI_EXTRA` at
+            // v2026.4.30) is a different surface again.
+            HermesSlashCommand(
+                name: Self.compressSlashName(capabilities: capabilities),
+                description: "Compress the conversation history",
+                argumentHint: nil,
+                source: .alwaysAvailable
+            ),
+            HermesSlashCommand(
+                name: "version",
+                description: "Show Hermes version",
+                argumentHint: nil,
+                source: .alwaysAvailable
+            )
+        ])
+        return result
+    }
+
+    /// Capability snapshot the chat surface uses to filter
+    /// `availableCommands`. Set by the chat controller (Mac
+    /// `ChatViewModel`, iOS `ChatController`) at session-start time and
+    /// kept fresh via the `HermesCapabilitiesStore` env binding. Default
+    /// `.empty` means "no v0.13 surfaces" — pre-v0.13 hosts and harness
+    /// scenarios (Previews, smoke tests) never expose `/goal` or
+    /// `/queue` until the controller publishes a real capabilities
+    /// value. `@ObservationIgnored` so capability refreshes don't trash
+    /// the streaming-message render budget; controllers call
+    /// `publishCapabilities(_:)` once per refresh tick.
+    @ObservationIgnored
+    public var capabilitiesGate: HermesCapabilities = .empty
+
+    /// Optimistic mirror of prompts the user has queued via `/queue …`
+    /// while a turn is in flight. Hermes is the authoritative owner
+    /// server-side; this list drives the chat-header chip + popover and
+    /// drains FIFO via `popQueuedPrompt()` when a turn completes.
+    /// Best-effort: if Hermes' server-side queue gets out of sync
+    /// (deferred prompt aborted, dropped on disconnect) the user sees a
+    /// stale chip until their next interaction.
+    public private(set) var queuedPrompts: [HermesQueuedPrompt] = []
+
+    /// Transient hint shown above the composer, e.g. "Guidance queued —
+    /// applies after the next tool call." for `/steer`. The chat view
+    /// auto-clears it after a short delay (handled in the view); the
+    /// model just owns the value.
+    public var transientHint: String?
+
+    /// Wall-clock start time of the current agent turn. Set when a fresh
+    /// user prompt enters an idle session (not for `/steer` which sends
+    /// during an active turn); cleared on `finalizeStreamingMessage`
+    /// after the duration is captured. Used to compute the per-turn
+    /// stopwatch displayed below assistant bubbles. v2.5.
+    private var currentTurnStart: Date?
+
+    /// Wall-clock duration of completed assistant turns, keyed by the
+    /// finalised assistant message's local id. Render the value in the
+    /// chat UI as a small "4.2s" pill below the bubble. Map grows
+    /// alongside the message list; cleared on `reset()`.
+    public private(set) var turnDurations: [Int: TimeInterval] = [:]
+
+    /// Look up a completed turn's duration. Nil for the streaming
+    /// placeholder (still in flight) and for any assistant message
+    /// that pre-dates the v2.5 stopwatch (e.g., loaded from state.db
+    /// for a resumed session).
+    public func turnDuration(forMessageId id: Int) -> TimeInterval? {
+        turnDurations[id]
+    }
+
+    /// Format a duration as a compact stopwatch label used by the chat
+    /// UI: `0.8s`, `4.2s`, `1m 12s`. Sub-second values render with one
+    /// decimal place; ≥60s switches to `<m>m <s>s`.
+    public static func formatTurnDuration(_ seconds: TimeInterval) -> String {
+        if seconds < 60 {
+            return String(format: "%.1fs", seconds)
+        }
+        let totalSeconds = Int(seconds.rounded())
+        let minutes = totalSeconds / 60
+        let remainder = totalSeconds % 60
+        return "\(minutes)m \(remainder)s"
+    }
+
+    /// Merged slash-menu list. Precedence: **ACP > project-scoped >
+    /// global Scarf > quick_commands** (most specific source wins).
+    /// De-duplicated by name. Non-interruptive ACP commands (`/steer`)
+    /// are always appended at the end so they don't crowd the more
+    /// frequently-used options.
+    public var availableCommands: [HermesSlashCommand] {
+        let acpNames = Set(acpCommands.map(\.name))
+        let projectAsHermes: [HermesSlashCommand] = projectScopedCommands
+            .filter { !acpNames.contains($0.name) }
+            .map { cmd in
+                HermesSlashCommand(
+                    name: cmd.name,
+                    description: cmd.description,
+                    argumentHint: cmd.argumentHint,
+                    source: .projectScoped
+                )
+            }
+        let projectNames = Set(projectAsHermes.map(\.name))
+        // Global Scarf commands sit BELOW project-scoped in the
+        // precedence chain — a project that authors its own `scarf-help`
+        // wins over the bundled one. Surface them with the same
+        // `.projectScoped` source for now (no UI distinction between
+        // project and global yet); add a dedicated `.globalScarf`
+        // source enum case if/when we want to differentiate them in
+        // the row chrome.
+        let globalAsHermes: [HermesSlashCommand] = globalScopedCommands
+            .filter { !acpNames.contains($0.name) && !projectNames.contains($0.name) }
+            .map { cmd in
+                HermesSlashCommand(
+                    name: cmd.name,
+                    description: cmd.description,
+                    argumentHint: cmd.argumentHint,
+                    source: .projectScoped
+                )
+            }
+        let globalNames = Set(globalAsHermes.map(\.name))
+        let quicks = quickCommands.filter {
+            !acpNames.contains($0.name)
+                && !projectNames.contains($0.name)
+                && !globalNames.contains($0.name)
+        }
+        let occupied = acpNames
+            .union(projectNames)
+            .union(globalNames)
+            .union(Set(quicks.map(\.name)))
+        // Capability gate: BOTH non-interruptive rows are v0.13 ACP
+        // surfaces — `steer` and `queue` are adjacent lines in the
+        // adapter's command dict and arrived at the same tag
+        // (`acp_adapter/server.py:170`/`:171` @ `v2026.5.7`, neither present
+        // at `v2026.4.30`). `/steer` used to fall through this switch's
+        // `default: return true` on the strength of a CLI/TUI-era "works on
+        // v0.11+" note, so a pre-v0.13 host was offered a name its adapter
+        // has never dispatched — and over ACP that is not an error:
+        // `_handle_slash_command` returns `None` and the text goes to the
+        // LLM, burning a turn (P34's lesson, applied to the row it missed).
+        //
+        // What stays unchanged: on a host AT or above the floor `/steer` is
+        // surfaced even with no session (P2 of the projects-feature fix —
+        // `disabledSlashCommandNames` greys it with an "Available once a
+        // chat is open" tooltip instead of hiding it, so a fresh launch does
+        // not show an empty menu). `/goal` and `/subgoal`
+        // are NOT in `nonInterruptiveCommands` (gateway-only, not advertised
+        // by the ACP adapter), so they never reach this filter.
+        let supported: [HermesSlashCommand] = Self.nonInterruptiveCommands.filter {
+            Self.nonInterruptiveSlashIsDispatched($0.name, capabilities: capabilitiesGate)
+        }
+        let nonInterruptive = supported.filter { !occupied.contains($0.name) }
+        // Static fallbacks. `/new` always shows; the rest of the agent-
+        // level command set (`/help`, `/model`, `/tools`, `/context`,
+        // `/reset`, the version-appropriate `/compact`-or-`/compress`,
+        // `/version` — the ACP adapter's own roster, see
+        // `alwaysAvailableCommands`) only when a
+        // session is active — Hermes ACP doesn't re-emit
+        // `available_commands_update` after `session/load`, so without
+        // this fallback resumed sessions showed an artificially sparse
+        // menu. Deduped against ACP / project / quick names so once a
+        // session starts and the ACP server advertises its richer
+        // versions, the ACP-sourced entry wins.
+        noteSlashCommandFallbackIfNeeded()
+        let alwaysAvailable = Self.alwaysAvailableCommands(capabilities: capabilitiesGate)
+            .filter { !occupied.contains($0.name) }
+        return acpCommands + projectAsHermes + globalAsHermes + quicks + nonInterruptive + alwaysAvailable
+    }
+
+    /// Publish a fresh capabilities snapshot from the controller.
+    /// Called whenever `HermesCapabilitiesStore.capabilities` changes
+    /// (initial detection, post-refresh, server switch). The chat input
+    /// bar's slash menu re-reads `availableCommands` lazily, so this is
+    /// just a stored-value swap — no observable churn.
+    public func publishCapabilities(_ caps: HermesCapabilities) {
+        capabilitiesGate = caps
+    }
+
+    /// Append an optimistically-queued prompt to the local mirror
+    /// (driven by `/queue <text>`). No-op for empty / whitespace input.
+    public func recordQueuedPrompt(text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        queuedPrompts.append(HermesQueuedPrompt(text: trimmed))
+    }
+
+    /// Per-session edit auto-approval mode (Hermes v0.15+ ACP
+    /// `session/set_mode`). Optimistic mirror — the chat-header picker
+    /// flips this immediately on tap and `ChatViewModel.switchApprovalMode`
+    /// reverts it if the RPC fails. Defaults to `.default` (ask before
+    /// edits); reset on every session boundary so a resumed/new session
+    /// doesn't inherit a stale mode. Hermes owns the authoritative value
+    /// server-side.
+    ///
+    /// **Known limitation:** this is a local indicator, not synced from the
+    /// `session/new`/`session/load` response. A fresh session genuinely
+    /// starts at `.default` (correct), but a *resumed* session whose mode
+    /// was changed elsewhere (a prior Scarf run, the TUI) will display
+    /// `.default` until the user re-selects. This is display-only —
+    /// actual edit prompting is driven by Hermes regardless of this chip.
+    /// Syncing from the response would require surfacing the advertised
+    /// `modes`/current-mode out of `ACPClient.newSession` (deferred).
+    public var activeApprovalMode: ACPApprovalMode = .default
+
+    /// Drain the next queued prompt off the local mirror, FIFO. Called
+    /// from `handlePromptComplete` once a turn settles — Hermes runs
+    /// the actual queued prompt server-side; popping here keeps the
+    /// header chip count honest. Returns the popped prompt for any
+    /// caller that wants to log it; the chat UI ignores the return.
+    @discardableResult
+    public func popQueuedPrompt() -> HermesQueuedPrompt? {
+        queuedPrompts.isEmpty ? nil : queuedPrompts.removeFirst()
+    }
+
+    /// True when `text` is a non-interruptive command that should NOT
+    /// flip `isAgentWorking` to true on send. Used by the Mac/iOS chat
+    /// view models to skip the "agent working" overlay change for
+    /// `/steer` (the agent's still on its current turn).
+    public func isNonInterruptiveSlash(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return false }
+        let withoutSlash = trimmed.dropFirst()
+        let name: String
+        if let space = withoutSlash.firstIndex(of: " ") {
+            name = String(withoutSlash[..<space])
+        } else {
+            name = String(withoutSlash)
+        }
+        return Self.nonInterruptiveCommands.contains { $0.name == name }
+    }
+
+    /// Whether the host's ACP adapter will DISPATCH this non-interruptive
+    /// slash name, rather than hand the raw text to the LLM.
+    ///
+    /// The one predicate behind both the slash-menu roster
+    /// (``availableCommands``) and the typed-command path
+    /// (``isDispatchedNonInterruptiveSlash(_:)``) — they used to answer the
+    /// floor question independently, and only the roster asked it. `steer`
+    /// and `queue` are adjacent lines in the adapter's command dict and
+    /// arrived at the same tag (`acp_adapter/server.py:170`/`:171` @
+    /// `v2026.5.7`; `acp_adapter/` at `v2026.4.30` has neither).
+    ///
+    /// `nil` and any other name answer `true`: this asks "is THIS name
+    /// floored", not "is this a slash command".
+    public static func nonInterruptiveSlashIsDispatched(
+        _ name: String?,
+        capabilities: HermesCapabilities
+    ) -> Bool {
+        switch name {
+        case "queue":   return capabilities.hasACPQueue
+        case "steer":   return capabilities.hasACPSteer
+        default:        return true
+        }
+    }
+
+    /// True when `text` is a non-interruptive command **this host will
+    /// actually dispatch**. The capability-aware twin of
+    /// ``isNonInterruptiveSlash(_:)``, and the one the send paths use.
+    ///
+    /// Below the v0.13 floor a typed `/steer` / `/queue` is not an error and
+    /// not a no-op: `_handle_slash_command` returns `None` for a name outside
+    /// `_COMMANDS` and the raw text falls through to the LLM as an ordinary
+    /// prompt (`acp_adapter/commands.py:88-95` @ `v2026.9.7`). It therefore
+    /// burns a real turn — which must show the normal working indicator and
+    /// must NOT paint a queue chip or a "runs after current turn" hint
+    /// (round-4 decision 12).
+    public func isDispatchedNonInterruptiveSlash(_ text: String) -> Bool {
+        guard isNonInterruptiveSlash(text) else { return false }
+        return Self.nonInterruptiveSlashIsDispatched(
+            Self.parseSlashName(text).name,
+            capabilities: capabilitiesGate
+        )
+    }
+
+    /// The one-line notice shown when a typed non-interruptive slash went to
+    /// the host as an ordinary prompt because its adapter has no such
+    /// command (round-4 decision 12). `nil` for every name that IS
+    /// dispatched, and for every name that was never non-interruptive.
+    ///
+    /// Deliberately says what happened rather than what to do: there is no
+    /// remedy on this host short of upgrading Hermes, and the turn the user
+    /// just spent is already running.
+    public static func subFloorSlashNotice(
+        name: String?,
+        capabilities: HermesCapabilities
+    ) -> String? {
+        guard let name,
+              nonInterruptiveCommands.contains(where: { $0.name == name }),
+              !nonInterruptiveSlashIsDispatched(name, capabilities: capabilities)
+        else { return nil }
+        return String(localized: "This Hermes has no /\(name) — sent as an ordinary prompt.")
+    }
+
+    /// Slash names Scarf used to answer locally that the ACP adapter has
+    /// never dispatched, at ANY tag — so on EVERY host the text reaches the
+    /// model as an ordinary prompt.
+    ///
+    /// `goal` and `subgoal` ARE real Hermes commands — `/goal` in the TUI
+    /// and gateway from `hermes_cli/commands.py:103` @ `v2026.5.7` and
+    /// `/subgoal` from `v2026.5.16` — but Scarf's chat speaks ACP, and the
+    /// adapter's command table has never carried either: `_COMMANDS` is
+    /// `acp_adapter/commands.py:44-66` @ `v2026.9.7` and
+    /// `_SLASH_COMMANDS` is `acp_adapter/server.py:163-173` @ `v2026.5.7`.
+    /// Nine names in each — not the SAME nine (`compact` at `v2026.5.7`
+    /// became `compress` by `v2026.9.7`) — but `goal` and `subgoal` are in
+    /// neither roster at either tag. `_handle_slash_command`
+    /// returns `None` for an unknown name and the raw text falls through to
+    /// the LLM (`commands.py:94-95`).
+    ///
+    /// Until P55 both names had an optimistic client mirror (a goal pill, a
+    /// subgoal count, "Goal locked" toasts) painting state no Hermes had
+    /// been asked for. Round-6 decision 3 dropped the mirrors; this notice
+    /// is what the `default:` arm says instead.
+    public static let acpUnhandledSlashNames: Set<String> = ["goal", "subgoal"]
+
+    /// The one-line notice for a name in ``acpUnhandledSlashNames``. `nil`
+    /// for every other name. Capability-free on purpose: there is no host
+    /// version on which the answer differs.
+    public static func acpUnhandledSlashNotice(name: String?) -> String? {
+        guard let name, acpUnhandledSlashNames.contains(name) else { return nil }
+        return String(localized: "Hermes chat has no /\(name) — sent as an ordinary prompt.")
+    }
+
+    /// Look up the full project-scoped command payload by slash trigger.
+    /// `ChatViewModel.sendPrompt` calls this when the input matches a
+    /// `.projectScoped` source and needs the body for client-side
+    /// expansion. Searches project commands first (a project that
+    /// authors `/scarf-help` should win over the bundled global one),
+    /// then falls back to the global store so `/scarf-*` commands work
+    /// in non-project chats too.
+    public func projectScopedCommand(named name: String) -> ProjectSlashCommand? {
+        if let cmd = projectScopedCommands.first(where: { $0.name == name }) {
+            return cmd
+        }
+        return globalScopedCommands.first { $0.name == name }
+    }
+
+    // MARK: - Shared slash menu helpers
+
+    /// Pull `(name, argTail)` out of a `/<name> [args]` invocation.
+    /// Returns `(nil, "")` for non-slash input. Used by both the Mac and
+    /// iOS send paths to special-case `/goal`, `/queue`, `/steer` before
+    /// the wire send.
+    public static func parseSlashName(_ text: String) -> (name: String?, args: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return (nil, "") }
+        let withoutSlash = trimmed.dropFirst()
+        if let space = withoutSlash.firstIndex(of: " ") {
+            return (
+                name: String(withoutSlash[..<space]),
+                args: String(withoutSlash[withoutSlash.index(after: space)...])
+            )
+        }
+        return (name: String(withoutSlash), args: "")
+    }
+
+    /// Slash commands Scarf handles entirely on the client and that
+    /// MUST NOT be forwarded to the ACP server. Hermes's ACP adapter
+    /// does not intercept these — sending them as prompts routes them
+    /// to the LLM, which responds in-character ("/new is a TUI slash
+    /// command, type it in the TUI prompt"). Reported in TestFlight
+    /// feedback ADyrlh (2026-05-11).
+    public enum ClientSideSlashCommand: Sendable, Equatable {
+        /// `/new [<name>]` — start a fresh chat session on the
+        /// client. `name` is the trimmed argument tail; nil when the
+        /// user typed bare `/new`. Pre-v0.13 hosts ignore the name
+        /// even when Hermes does honor it.
+        case newSession(name: String?)
+    }
+
+    /// Classify input text against the client-side slash command set.
+    /// Returns nil for plain prompts, project-scoped commands,
+    /// non-interruptive (`/steer` / `/goal` / `/queue`), and
+    /// ACP-handled commands — all of which keep their existing wire
+    /// paths.
+    public static func clientSideSlashCommand(for text: String) -> ClientSideSlashCommand? {
+        let parsed = parseSlashName(text)
+        switch parsed.name {
+        case "new":
+            let trimmed = parsed.args.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .newSession(name: trimmed.isEmpty ? nil : trimmed)
+        default:
+            return nil
+        }
+    }
+
+    // MARK: - Non-vision image heads-up (t-31img / gh#113)
+
+    /// The session's effective model — the same resolution the
+    /// `ChatModelBadge` displays: the per-session preset override when
+    /// one is set, else the global `config.yaml` default
+    /// (`model.provider` + `model.default`). Nil when neither yields a
+    /// usable (provider, model) pair — e.g. fresh installs, or the
+    /// Local tab's legal empty-`model.default` auto-detect config —
+    /// which callers must treat as capability-unknown, never as
+    /// "not vision-capable".
+    ///
+    /// `""` and the YAML parser's `"unknown"` fallback both mean unset,
+    /// matching `ModelPreflight`.
+    public static func resolveActiveModel(
+        preset: ModelPreset?,
+        configProvider: String,
+        configModel: String
+    ) -> (providerID: String, modelID: String)? {
+        if let preset {
+            return (preset.providerID, preset.modelID)
+        }
+        func unset(_ value: String) -> Bool {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return trimmed.isEmpty || trimmed == "unknown"
+        }
+        guard !unset(configProvider), !unset(configModel) else { return nil }
+        return (
+            configProvider.trimmingCharacters(in: .whitespacesAndNewlines),
+            configModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    /// Whether the composer should render the "this model can't see
+    /// images" heads-up. Only a confident `.no` warns — `.unknown`
+    /// covers local models and custom endpoints that models.dev doesn't
+    /// mirror (`llama3.2-vision` exists; don't false-positive), and
+    /// `.yes` obviously doesn't. Never blocks sending: Hermes may still
+    /// handle the image via its auxiliary vision fallback.
+    public static func shouldShowNonVisionImageHint(
+        attachmentCount: Int,
+        capability: ModelCatalogService.VisionCapability
+    ) -> Bool {
+        attachmentCount > 0 && capability == .no
+    }
+
+    /// Copy for the heads-up row. Kept here (not inline in the View) so
+    /// the wording is pinned by ScarfCore tests alongside the decision
+    /// logic.
+    public static func nonVisionImageHint(modelDisplayName: String) -> String {
+        "\(modelDisplayName) can't see images natively — Hermes will describe them via its vision fallback; results may be lossy. Pick a vision model to send pixels."
+    }
+
+    /// True when config.yaml overrides Hermes's models.dev-based image
+    /// routing in a way that makes a confident catalog `.no` verdict
+    /// unreliable — the composer heads-up must stay quiet then, because
+    /// its copy ("Hermes will describe them via its vision fallback")
+    /// would be false:
+    ///
+    /// - `agent.image_input_mode: native` — `decide_image_input_mode`
+    ///   returns `"native"` before any capability lookup; Hermes
+    ///   attaches pixels unconditionally.
+    /// - `model.supports_vision: <true token>` — the user declared the
+    ///   active model vision-capable; `_lookup_supports_vision` honors
+    ///   the override before models.dev, so auto mode routes native.
+    ///
+    /// Token handling mirrors Hermes (`image_routing.py`): the mode
+    /// must equal `native` exactly (`_coerce_mode` treats anything else
+    /// as no override for our purposes), and the vision override
+    /// accepts `_TRUE_TOKENS` = true/yes/on/1. A false-token or absent
+    /// value keeps the catalog verdict. Per-provider per-model
+    /// overrides (`providers.<p>.models.<m>.supports_vision`) are NOT
+    /// mirrored — those describe custom/local models, which already
+    /// resolve `.unknown` and never warn.
+    public static func nonVisionHintSuppressedByConfig(configYAML: String) -> Bool {
+        let values = HermesYAML.parseNestedYAML(configYAML).values
+        func scalar(_ key: String) -> String {
+            HermesYAML.stripYAMLQuotes(values[key] ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+        }
+        if scalar("agent.image_input_mode") == "native" { return true }
+        return ["true", "yes", "on", "1"].contains(scalar("model.supports_vision"))
+    }
+
+    /// Slash menu visibility predicate: show only while the user is
+    /// typing the command token (text starts with `/` and contains no
+    /// whitespace). Once a space or newline appears the user is typing
+    /// arguments and the menu hides.
+    public static func shouldShowSlashMenu(text: String) -> Bool {
+        guard text.hasPrefix("/") else { return false }
+        return !text.contains(" ") && !text.contains("\n")
+    }
+
+    /// Strip the leading `/` so the slash menu can prefix-match the
+    /// remaining query against command names.
+    public static func slashMenuQuery(text: String) -> String {
+        guard text.hasPrefix("/") else { return "" }
+        return String(text.dropFirst())
+    }
+
+    /// Case-insensitive prefix match on command names. Empty query
+    /// returns the full list unchanged.
+    public static func filterSlashCommands(_ commands: [HermesSlashCommand], query: String) -> [HermesSlashCommand] {
+        let q = query.lowercased()
+        if q.isEmpty { return commands }
+        return commands.filter { $0.name.lowercased().hasPrefix(q) }
+    }
+
+    /// Names of slash-menu rows that should render greyed-out + ignore
+    /// taps.
+    ///
+    /// Two grey-out conditions:
+    /// - **No active session** (P2 of the projects-feature fix): every
+    ///   agent-side command (the version-appropriate
+    ///   `/compact`-or-`/compress`, `/help /model /tools /context
+    ///   /reset /version`, plus non-interruptive `/steer /queue`) needs a
+    ///   live ACP session to do anything.
+    ///   Surfacing them greyed gives the user a visible "what's
+    ///   coming once you open a chat" instead of an empty menu.
+    /// - **Idle session**: `/queue` needs a turn in flight to queue behind.
+    ///   `_queue_prompt` appends to `state.queued_prompts` unconditionally
+    ///   (`acp_adapter/commands.py:33-36` @ `v2026.9.7`; `_cmd_queue` calls
+    ///   it at `:285-290` after rejecting an empty argument), but the only
+    ///   drain is the tail of a running turn (`server.py:908-915`) — and a
+    ///   dispatched slash command returns `end_turn` at `server.py:793-799`,
+    ///   BEFORE that drain. So on an idle session the prompt sits there
+    ///   until the user's NEXT turn ends and then runs behind it — two turns
+    ///   away from what the row promises.
+    ///
+    /// There is deliberately no pre-v0.13 `/steer` arm any more (round-4
+    /// decision 14). It asked `hasACPSteerOnIdle`, which was `hasACPSteer`
+    /// expressed once — and since P37 the roster hides `steer` entirely
+    /// below that same floor, so the arm could not fire and its reason
+    /// string could not render. The idle fallback shipped in `/steer`'s own
+    /// commit (`acp_adapter/server.py:812-820` @ `v2026.5.7`): no host has
+    /// the command without it.
+    public static func disabledSlashCommandNames(
+        isAgentWorking: Bool,
+        hasActiveSession: Bool,
+        capabilities: HermesCapabilities
+    ) -> Set<String> {
+        var disabled: Set<String> = []
+        if !hasActiveSession {
+            disabled.formUnion(Self.sessionRequiredCommandNames)
+        }
+        if hasActiveSession && !isAgentWorking && capabilities.hasACPQueue {
+            disabled.insert("queue")
+        }
+        return disabled
+    }
+
+    /// Slash commands that need a live ACP session to do anything. Used
+    /// by `disabledSlashCommandNames` to grey-out the menu rows when the
+    /// user is looking at the input bar pre-session. Kept in one place
+    /// so the menu and any future enable/disable checks stay in sync.
+    /// Includes both `compact` and `compress` since this set is a static,
+    /// capability-independent membership check and only one spelling is
+    /// ever surfaced at a time (see ``compressSlashName(capabilities:)``).
+    /// `/new` is absent on purpose: it is the client-side "open a session"
+    /// affordance, so it must stay tappable pre-session. P34 dropped
+    /// `clear`, `cost`, `reload-skills`, `exit`, `yolo`, `sessions` and
+    /// `codex-runtime` from this set along with the menu — the ACP adapter
+    /// dispatches none of them at any tag.
+    public static let sessionRequiredCommandNames: Set<String> = [
+        "help", "model", "tools", "context", "reset", "version",
+        "compact", "compress",
+        "steer", "queue"
+    ]
+
+    /// Tooltip / inline help text shown next to disabled rows. Returns
+    /// nil when no rows are disabled. Two cases, two sentences: the
+    /// pre-session "open a chat first" one, and the idle-session `/queue`
+    /// one — both are "this command needs a state we're not in yet".
+    public static func disabledSlashCommandReason(
+        isAgentWorking: Bool,
+        hasActiveSession: Bool,
+        capabilities: HermesCapabilities
+    ) -> String? {
+        if !hasActiveSession {
+            return String(localized: "Available once a chat is open. Press Return on `/new` (or click an existing session) to start one.")
+        }
+        let disabled = disabledSlashCommandNames(
+            isAgentWorking: isAgentWorking,
+            hasActiveSession: hasActiveSession,
+            capabilities: capabilities
+        )
+        guard !disabled.isEmpty else { return nil }
+        return String(localized: "Use `/queue` while the agent is working — on an idle session Hermes holds the prompt until your next turn finishes, then runs it.")
+    }
+
+    /// A typed `/queue <text>` on an IDLE session: the plain prompt to send
+    /// in its place, or `nil` to send the text unchanged.
+    ///
+    /// The menu row greys out on an idle session (see
+    /// ``disabledSlashCommandNames(isAgentWorking:hasActiveSession:capabilities:)``),
+    /// but typing the command was never gated, and both send paths painted
+    /// "Queued — runs after current turn." over something that does not
+    /// happen: `_queue_prompt` appends unconditionally
+    /// (`acp_adapter/commands.py:33-36` @ `v2026.9.7`) while the only drain
+    /// is the tail of a running turn (`server.py:908-915`), which the
+    /// dispatched slash command never reaches — it returns `end_turn` at
+    /// `server.py:793-799`. So the prompt would sit in `queued_prompts`
+    /// until the NEXT turn ended, and run two turns from now.
+    ///
+    /// Sending the argument as an ordinary prompt is what makes the notice
+    /// true; leaving the `/queue` prefix on the wire would hand it back to
+    /// `_cmd_queue`. An EMPTY argument is left alone on purpose — Hermes
+    /// answers `Usage: /queue <prompt>` (`commands.py:286-288`), which is
+    /// the honest response to a command with nothing to queue, and there is
+    /// no plain prompt to send instead.
+    ///
+    /// Only for a host that WOULD dispatch it: below the v0.13 floor the
+    /// text already goes to the LLM verbatim and
+    /// ``subFloorSlashNotice(name:capabilities:)`` owns that case.
+    public static func idleQueueFallbackText(
+        name: String?,
+        args: String,
+        isAgentWorking: Bool,
+        capabilities: HermesCapabilities
+    ) -> String? {
+        guard name == "queue",
+              !isAgentWorking,
+              nonInterruptiveSlashIsDispatched(name, capabilities: capabilities)
+        else { return nil }
+        let trimmed = args.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// The one-line notice that accompanies
+    /// ``idleQueueFallbackText(name:args:isAgentWorking:capabilities:)``.
+    public static var idleQueueNotice: String {
+        String(localized: "Nothing is running — sent as a normal prompt instead of queueing it.")
+    }
+
+    /// A typed `/steer <text>` on an IDLE session is an ORDINARY TURN, and
+    /// Scarf must paint it as one.
+    ///
+    /// Walked at `v2026.9.7`. `_rewrite_prompt_for_interrupt`
+    /// (`acp_adapter/server.py:667-689`) runs at `:789` — BEFORE the slash
+    /// dispatch at `:792-793`. For a text-only `/steer` with a non-empty
+    /// argument it takes `_take_interrupted_prompt(state)` and, when the
+    /// session is idle, returns `(steer_text, steer_text)` (`:686`): the
+    /// leading `/steer` is GONE, so `:792`'s `startswith("/")` is false,
+    /// `_handle_slash_command` is never reached, and the text runs as a real
+    /// turn through `_run_agent_turn` (`:812-824`). (After a cancel the same
+    /// arm replays the interrupted prompt with the steer text attached,
+    /// `:684-685` — also a real turn.) The fallback shipped with `/steer`
+    /// itself: `server.py:812-824` @ `v2026.5.7`.
+    ///
+    /// So the pre-P46 idle `/steer` painted "Guidance queued — applies after
+    /// the next tool call." over a turn that was starting right then, with
+    /// the working indicator suppressed and no `turnGeneration` recorded —
+    /// which meant **Stop could not cancel it**. This is the `/queue` shape
+    /// P44b fixed, one row up.
+    ///
+    /// The difference from `/queue` is the WIRE: Hermes strips the prefix
+    /// itself, so the text goes out unchanged as `/steer <args>` and there is
+    /// no fallback text to substitute — only a notice and an ordinary-turn
+    /// treatment. An EMPTY argument is left alone: `:681-682` returns the
+    /// text untouched and the dispatched `_cmd_steer` answers for it.
+    ///
+    /// Only for a host that WOULD dispatch it; below the v0.13 floor the text
+    /// already goes to the LLM verbatim and
+    /// ``subFloorSlashNotice(name:capabilities:)`` owns that case.
+    public static func idleSteerIsOrdinaryPrompt(
+        name: String?,
+        args: String,
+        isAgentWorking: Bool,
+        capabilities: HermesCapabilities
+    ) -> Bool {
+        guard name == "steer",
+              !isAgentWorking,
+              nonInterruptiveSlashIsDispatched(name, capabilities: capabilities)
+        else { return false }
+        return !args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// The one-line notice that accompanies
+    /// ``idleSteerIsOrdinaryPrompt(name:args:isAgentWorking:capabilities:)``.
+    public static var idleSteerNotice: String {
+        String(localized: "Nothing is running — Hermes runs this as a normal prompt instead of steering.")
+    }
+
+    /// Expand `/<name> args` when `<name>` matches a loaded project-
+    /// scoped command. Falls through (returns the input unchanged) for
+    /// non-slash input, unknown names, ACP-advertised commands, and
+    /// quick_commands — those go to Hermes literally. The caller
+    /// provides the `ServerContext` so the expansion service can read
+    /// the project sidecar through the right transport.
+    public func expandIfProjectScoped(
+        _ text: String,
+        context: ServerContext
+    ) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return text }
+        let withoutSlash = String(trimmed.dropFirst())
+        let name: String
+        let argument: String
+        if let space = withoutSlash.firstIndex(of: " ") {
+            name = String(withoutSlash[..<space])
+            argument = String(withoutSlash[withoutSlash.index(after: space)...])
+        } else {
+            name = withoutSlash
+            argument = ""
+        }
+        guard !name.isEmpty,
+              let cmd = projectScopedCommand(named: name)
+        else { return text }
+        return ProjectSlashCommandService(context: context).expand(cmd, withArgument: argument)
+    }
+
+    public var supportsCompress: Bool {
+        // Either spelling counts: pre-0.19.1 ACP hosts advertise `compact`
+        // and that is their compress command. See `compressSlashName`.
+        availableCommands.contains { $0.name == "compress" || $0.name == "compact" }
+    }
+
+    /// True when the menu carries more than just the compress command — used to hide
+    /// the dedicated compress button in favor of the full slash menu.
+    public var hasBroaderCommandMenu: Bool { availableCommands.count > 1 }
+
+    public var hasMessages: Bool { !messages.isEmpty }
+
+    public func requestScrollToBottom() {
+        scrollTrigger = UUID()
+    }
+
+    public private(set) var sessionId: String?
+    /// Wall-clock timestamp of when this view model attached to its
+    /// The original CLI session ID when resuming a CLI session via ACP.
+    /// Used to combine old CLI messages with new ACP messages.
+    public private(set) var originSessionId: String?
+    /// Smallest DB id currently loaded for the *current session* (i.e.
+    /// `sessionId`). Drives `loadEarlier()`: page back with
+    /// `before: oldestLoadedMessageID`. `nil` when nothing has been
+    /// loaded yet or the session has no DB-persisted messages.
+    public private(set) var oldestLoadedMessageID: Int?
+    /// Whether the most recent fetch suggests there are more older
+    /// messages on disk that haven't been loaded into `messages` yet.
+    /// Set to `true` when the initial fetch returned exactly `limit`
+    /// rows (a strong hint the table has more). Drives the "Load
+    /// earlier" button visibility in chat views.
+    public private(set) var hasMoreHistory: Bool = false
+    /// Cleared during a `loadEarlier()` fetch so the UI can show a
+    /// spinner and we don't fan out duplicate page requests.
+    public private(set) var isLoadingEarlier: Bool = false
+    /// Recall-mode boundary (Alan, 2026-09-03): rows paged in via
+    /// `loadEarlier()` — ids strictly below this value — render as
+    /// prompts + text replies + one muted activity marker per turn,
+    /// with no tool cards or reasoning. `nil` until the first page
+    /// lands; the session-open window always renders in full.
+    public private(set) var earlierHistoryCutoffId: Int?
+    private var nextLocalId = -1
+
+    /// Issue #63: locally-created user messages awaiting state.db
+    /// persistence, keyed by session id. ACP roundtrips Hermes' DB
+    /// write asynchronously, so a user who sends a prompt and
+    /// immediately switches to another session triggers `reset()`
+    /// before Hermes flushes the row — `loadSessionHistory` then reads
+    /// from a DB that doesn't have the message yet, and the bubble
+    /// renders blank or vanishes on return. We hold a per-session
+    /// copy here that survives `reset()` so `loadSessionHistory` can
+    /// re-inject anything still in flight, and clean entries out as
+    /// soon as a matching DB row appears.
+    private var pendingLocalUserMessages: [String: [HermesMessage]] = [:]
+
+    private var streamingAssistantText = ""
+    private var streamingThinkingText = ""
+    private var streamingToolCalls: [HermesToolCall] = []
+
+    // MARK: - Streaming UI coalescing (gh#140)
+    //
+    // ACP chunks can arrive far faster than any display refresh —
+    // the gh#140 perf log shows inter-chunk gaps of ~30 µs (tens of
+    // thousands of events per second during a fast stream or a
+    // buffered burst). Upserting the observable `messages` /
+    // `messageGroups` state once per chunk made every chunk pay an
+    // O(message-length) HermesMessage copy AND invalidate the whole
+    // transcript's observation graph, so the main thread pegged a
+    // core re-running SwiftUI bodies (each of which re-renders the
+    // full streaming markdown — quadratic over the turn). The text
+    // buffers above still accumulate per-chunk (cheap string append);
+    // the OBSERVABLE upsert is throttled to `streamingFlushInterval`
+    // with a trailing flush so the last partial interval always lands.
+    @ObservationIgnored private var streamingFlushTask: Task<Void, Never>?
+    @ObservationIgnored private var lastStreamingUpsert: ContinuousClock.Instant?
+    /// 50 ms ≈ 20 UI updates/sec — indistinguishable from live
+    /// streaming to the eye, ~3 orders of magnitude fewer transcript
+    /// invalidations than chunk-rate during a burst.
+    private static let streamingFlushInterval: Duration = .milliseconds(50)
+
+    /// Throttled path to `upsertStreamingMessage()` for high-frequency
+    /// text chunks. Structural events (tool call start/complete,
+    /// finalize, promptComplete) bypass this and mutate directly —
+    /// group boundaries must land immediately and those events are
+    /// rare. Leading edge flushes immediately (first chunk of a turn
+    /// renders with no added latency); within the interval a single
+    /// trailing task picks up whatever accumulated.
+    private func scheduleStreamingUpsert() {
+        let now = ContinuousClock.now
+        if let last = lastStreamingUpsert, now - last < Self.streamingFlushInterval {
+            guard streamingFlushTask == nil else { return }
+            streamingFlushTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: Self.streamingFlushInterval)
+                guard let self, !Task.isCancelled else { return }
+                self.streamingFlushTask = nil
+                self.flushStreamingUpsertNow()
+            }
+            return
+        }
+        flushStreamingUpsertNow()
+    }
+
+    /// Immediate upsert + throttle-clock stamp. The empty-state guard
+    /// makes a stale trailing flush (one that fires after finalize or
+    /// reset cleared the buffers) a no-op instead of resurrecting an
+    /// empty id=0 placeholder bubble.
+    private func flushStreamingUpsertNow() {
+        guard !streamingAssistantText.isEmpty
+            || !streamingThinkingText.isEmpty
+            || !streamingToolCalls.isEmpty else { return }
+        lastStreamingUpsert = ContinuousClock.now
+        upsertStreamingMessage()
+    }
+
+    /// Cancel any pending trailing flush. Called wherever streaming
+    /// state is torn down (finalize, reset, new-turn start) so a
+    /// buffered flush can't run against the next turn's fresh state.
+    private func cancelStreamingFlush() {
+        streamingFlushTask?.cancel()
+        streamingFlushTask = nil
+        lastStreamingUpsert = nil
+    }
+
+    /// True while a turn is in flight, has emitted thought-stream
+    /// bytes, but has NOT yet produced any visible assistant text.
+    /// Surfaces the user-facing "Thinking…" status promotion (the
+    /// model is reasoning before answering — Hermes reasoning models
+    /// commonly take 3–8 s here, which the ScarfMon `firstThoughtByte`
+    /// vs `firstByte` split makes visible). Becomes false the moment
+    /// the first message chunk arrives or the turn ends.
+    public var isStreamingThoughtsOnly: Bool {
+        currentTurnStart != nil
+            && !streamingThinkingText.isEmpty
+            && streamingAssistantText.isEmpty
+    }
+
+    // MARK: - Analytics turn tracking (Phase 4)
+    //
+    // Deliberately separate from the user-visible `currentTurnStart` /
+    // `turnDurations` stopwatch: that one is reset by *every*
+    // `finalizeStreamingMessage`, which runs once per completed tool call,
+    // so it can't answer "did this turn end". These three answer exactly
+    // one question — has the turn that is currently in flight already
+    // reported — so `agent_turn_completed` / `agent_turn_failed` fire at
+    // most once per turn no matter how many chunks, tool calls, finalizes
+    // or late connection-lost events stream through.
+    //
+    // All three are `@ObservationIgnored`: they carry no UI meaning, and
+    // mutating an observed property from the `availableCommands` getter
+    // (see `noteSlashCommandFallbackIfNeeded`) would write to state during
+    // a SwiftUI view update.
+
+    /// Start of the in-flight agent turn, or `nil` when no turn is open
+    /// (idle, or the turn already reported). Cleared at the moment the
+    /// terminal event is emitted — that nil-ing *is* the once-per-turn
+    /// guard.
+    @ObservationIgnored
+    private var analyticsTurnStart: Date?
+
+    /// Tool calls started since the in-flight turn began. Reset with
+    /// `analyticsTurnStart`, never mid-turn.
+    @ObservationIgnored
+    private var analyticsTurnToolCalls = 0
+
+    /// Once-per-session latch for `session_resume_fallback`'s
+    /// `slash_command_fallback` kind. `availableCommands` is a computed
+    /// property read on every composer render; without this the fallback
+    /// would emit at frame rate.
+    @ObservationIgnored
+    private var analyticsReportedSlashFallback = false
+
+    // DB polling state (used in terminal mode fallback)
+    private var lastKnownFingerprint: HermesDataService.MessageFingerprint?
+    private var debounceTask: Task<Void, Never>?
+    private var resetTimestamp: Date?
+    private var userSendPending = false
+    private var activePollingTimer: Timer?
+    /// Replay-suppression gate: true once a prompt has actually been
+    /// sent in the currently-attached session. Set by `addUserMessage`
+    /// AND by `markPromptSent()` (which every send site must call at
+    /// the point the prompt goes over the wire), cleared by
+    /// `setSessionId` / `reset`. Until set, streamed content events
+    /// (`messageChunk`, `thoughtChunk`, `toolCallStart`,
+    /// `toolCallUpdate`) are dropped — Hermes' ACP adapter sometimes
+    /// streams the recent session state as a sequence of agent events
+    /// after `session/load`, OR auto-resumes in-flight work for
+    /// sessions with persistent goals / queued prompts. Either way the
+    /// user perceives bubbles materializing one-by-one when they open
+    /// an old chat. The DB-fetched history is authoritative for the
+    /// existing transcript; live agent work resumes once a prompt is
+    /// actually sent.
+    ///
+    /// `promptComplete` is intentionally NOT gated (2026-07-13, S2):
+    /// it never comes from the session/load replay — ACPEventParser
+    /// never yields it; each send path synthesizes it from
+    /// `sendPrompt`'s return — and it carries turn accounting, the
+    /// `isAgentWorking` clear, and the no-output failure bubble.
+    /// Gate-dropping it turned any turn whose echo/gate bookkeeping
+    /// slipped into a silent, never-finishing spinner.
+    private var hasUserSentPromptThisSession = false
+
+    public struct PendingPermission {
+        public let requestId: Int
+        public let title: String
+        public let kind: String
+        public let options: [(optionId: String, name: String)]
+
+        public init(
+            requestId: Int,
+            title: String,
+            kind: String,
+            options: [(optionId: String, name: String)]
+        ) {
+            self.requestId = requestId
+            self.title = title
+            self.kind = kind
+            self.options = options
+        }
+    }
+
+    // MARK: - Reset
+
+    public func reset() {
+        debounceTask?.cancel()
+        hydrationTask?.cancel()
+        hydrationTask = nil
+        isHydratingTools = false
+        stopActivePolling()
+        Task { await dataService.close() }
+        messages = []
+        messageGroups = []
+        renderWindow = RenderWindow.initial
+        currentSession = nil
+        lastKnownFingerprint = nil
+        sessionId = nil
+        originSessionId = nil
+        oldestLoadedMessageID = nil
+        hasMoreHistory = false
+        isLoadingEarlier = false
+        earlierHistoryCutoffId = nil
+        isAgentWorking = false
+        userSendPending = false
+        hasUserSentPromptThisSession = false
+        resetTimestamp = Date()
+        nextLocalId = -1
+        streamingAssistantText = ""
+        streamingThinkingText = ""
+        streamingToolCalls = []
+        cancelStreamingFlush()
+        setLiveActivityStatus(nil)
+        acpInputTokens = 0
+        acpOutputTokens = 0
+        acpThoughtTokens = 0
+        acpError = nil
+        acpErrorHint = nil
+        acpErrorDetails = nil
+        acpCachedReadTokens = 0
+        acpCompressionCount = 0
+        // `acpCommands` is intentionally NOT cleared. ACP slash commands
+        // are agent-level (advertised once per process via
+        // `available_commands_update` typically piggy-backing on
+        // `session/new`); they don't change when the user switches
+        // sessions. Hermes does not re-emit on `session/load`, so if
+        // we wipe here, resumed sessions land at a 4-command fallback
+        // until the user starts a fresh session — observed during
+        // dogfooding against a Hermes v0.13 host. The caller paths
+        // (startNewSession, resumeSession, continueLastSession) all
+        // spawn a fresh ACP subprocess; if that subprocess emits a
+        // fresh list, our value is replaced; if it doesn't, we keep
+        // the most recently-known agent-level set, which stays
+        // accurate as long as the agent identity hasn't changed. The
+        // host-switch case (Local → SSH) tears down the whole
+        // ContextBoundRoot so this stale carry-over isn't reachable
+        // there.
+        projectScopedCommands = []
+        // Any turn still in flight belongs to the session we're leaving and
+        // has no honest outcome — drop it rather than attributing it to the
+        // session we're about to attach to. The slash-command fallback latch
+        // re-arms because the next session gets its own answer.
+        discardAnalyticsTurn()
+        analyticsReportedSlashFallback = false
+        currentTurnStart = nil
+        turnDurations = [:]
+        transientHint = nil
+        clearPendingPermissions()
+        // v2.8 / Hermes v0.13 — drop the optimistic queue mirror on
+        // session reset so a fresh chat (or a resume into a different
+        // session) doesn't paint stale queue state from the previous one.
+        // The capabilities gate stays on whatever the controller most
+        // recently published; it's a host-level value that doesn't change
+        // with session boundaries.
+        queuedPrompts = []
+        // v0.15 — the per-session edit auto-approval mode is session-
+        // scoped; a fresh chat starts back at the default "ask before
+        // edits" posture rather than carrying the previous session's mode.
+        activeApprovalMode = .default
+        loadQuickCommands()
+    }
+
+    public func setSessionId(_ id: String?) {
+        sessionId = id
+        lastKnownFingerprint = nil
+        // Reset the user-engagement gate on every session change so
+        // the next chat we attach to also drops post-load replay
+        // events until the user prompts.
+        hasUserSentPromptThisSession = false
+    }
+
+    public func cleanup() async {
+        stopActivePolling()
+        debounceTask?.cancel()
+        await dataService.close()
+    }
+
+    /// Re-fetch session metadata from DB to pick up cost/token updates.
+    public func refreshSessionFromDB() async {
+        await ScarfMon.measureAsync(.sessionLoad, "mac.refreshSessionFromDB") {
+            guard let sessionId else { return }
+            let opened = await dataService.open()
+            guard opened else { return }
+            if let session = await dataService.fetchSession(id: sessionId) {
+                currentSession = session
+            }
+            await dataService.close()
+        }
+    }
+
+    // MARK: - ACP Event Handling
+
+    /// Open the replay-suppression gate: call at the point a prompt is
+    /// actually handed to the agent (e.g. `ChatViewModel.sendViaACP`),
+    /// independent of whether a local echo bubble was appended.
+    /// `addUserMessage` also opens the gate, but send paths that echo
+    /// the message BEFORE session setup completes lose that open when
+    /// `setSessionId` resets the gate (autoStart), and paths that skip
+    /// the echo never opened it at all — either way the turn's streamed
+    /// chunks would be dropped as replay. Idempotent.
+    public func markPromptSent() {
+        hasUserSentPromptThisSession = true
+    }
+
+    /// Add a user message immediately (before DB write) for instant UI feedback.
+    public func addUserMessage(text: String) {
+        // Fresh prompt → clear any stale error banner from a prior
+        // failed attempt so we don't show "old error" + "still thinking…"
+        // simultaneously. Matches the Mac ChatViewModel pattern.
+        clearACPErrorState()
+        // Mark this session as user-engaged so subsequent ACP content
+        // events (chunks, tool calls, prompt completes) get processed
+        // and rendered. Until this fires, those events are dropped
+        // — see `handleACPEvent` for the rationale.
+        hasUserSentPromptThisSession = true
+        let id = nextLocalId
+        nextLocalId -= 1
+        let message = HermesMessage(
+            id: id,
+            sessionId: sessionId ?? "",
+            role: "user",
+            content: text,
+            toolCallId: nil,
+            toolCalls: [],
+            toolName: nil,
+            timestamp: Date(),
+            tokenCount: nil,
+            finishReason: nil,
+            reasoning: nil
+        )
+        messages.append(message)
+        // Track the local message in the pending-user-messages cache
+        // so a reset/resume cycle on this session before Hermes
+        // persists the row can still re-inject it on return (#63).
+        if let sid = sessionId {
+            pendingLocalUserMessages[sid, default: []].append(message)
+        }
+        // Per-turn stopwatch (v2.5): record the start time only when
+        // we're entering a fresh agent turn. /steer-style mid-run sends
+        // arrive while isAgentWorking is already true; preserve the
+        // existing start so the captured duration reflects the FULL
+        // turn (initial prompt → final reply), not just the time since
+        // the user nudged.
+        if !isAgentWorking {
+            currentTurnStart = Date()
+        }
+        // Analytics turn clock. Same "only on a fresh turn" rule as the
+        // stopwatch above, but with its own state so a mid-turn finalize
+        // can't close it early.
+        beginAnalyticsTurn()
+        isAgentWorking = true
+        streamingAssistantText = ""
+        streamingThinkingText = ""
+        streamingToolCalls = []
+        cancelStreamingFlush()
+        buildMessageGroups()
+        // User just submitted — jump to the bottom so they see their message
+        // and the incoming response. `.defaultScrollAnchor(.bottom)` handles
+        // slow streaming fine, but rapid responses (slash commands especially)
+        // arrive faster than the anchor can track.
+        requestScrollToBottom()
+    }
+
+    // MARK: - Analytics: agent turn lifecycle
+
+    /// Map an ACP `stopReason` onto the taxonomy's `error_kind`. `nil` means
+    /// "this turn succeeded" — only `end_turn` qualifies.
+    ///
+    /// The input is a small closed vocabulary Hermes emits, but it is still a
+    /// *string from the agent*, so it is never forwarded: anything
+    /// unrecognized collapses to `agent_error` rather than leaking through.
+    static func analyticsTurnErrorKind(stopReason: String) -> String? {
+        switch stopReason.lowercased() {
+        case "end_turn":
+            return nil
+        case "cancelled", "canceled":
+            // A user-cancelled turn is not an agent failure; it gets its own
+            // kind so the failure rate isn't inflated by people changing
+            // their minds mid-run.
+            return "cancelled"
+        case "timeout", "timed_out":
+            return "timeout"
+        default:
+            // `refusal`, `error`, `max_tokens`, and anything a future Hermes
+            // invents.
+            return "agent_error"
+        }
+    }
+
+    /// Open an analytics turn. Idempotent for the turn's lifetime — a
+    /// `/steer`-style mid-run send must not restart the clock or wipe the
+    /// tool-call tally.
+    private func beginAnalyticsTurn() {
+        guard analyticsTurnStart == nil else { return }
+        analyticsTurnStart = Date()
+        analyticsTurnToolCalls = 0
+    }
+
+    /// Close the in-flight analytics turn, emitting exactly one terminal
+    /// event. A second call (a connection-lost arriving after the prompt
+    /// already completed, a retry ladder, a `reset()` mid-stream) finds
+    /// `analyticsTurnStart == nil` and does nothing.
+    ///
+    /// - Parameter errorKind: `nil` for a successful turn.
+    private func endAnalyticsTurn(errorKind: String?) {
+        guard let start = analyticsTurnStart else { return }
+        analyticsTurnStart = nil
+        let toolCalls = analyticsTurnToolCalls
+        analyticsTurnToolCalls = 0
+        if let errorKind {
+            ScarfAnalytics.record("agent_turn_failed", ["error_kind": errorKind])
+        } else {
+            ScarfAnalytics.record("agent_turn_completed", [
+                "duration_bucket": ScarfAnalytics.durationBucket(Date().timeIntervalSince(start)),
+                "tool_call_count_bucket": ScarfAnalytics.toolCallCountBucket(toolCalls),
+            ])
+        }
+    }
+
+    /// Abandon the in-flight turn without reporting it. Used by `reset()`:
+    /// the user switched sessions or restarted the chat, so whatever was in
+    /// flight has no honest outcome to record.
+    private func discardAnalyticsTurn() {
+        analyticsTurnStart = nil
+        analyticsTurnToolCalls = 0
+    }
+
+    /// Emit `session_resume_fallback {kind: slash_command_fallback}` the first
+    /// time this session has to fall back to the static command list because
+    /// Hermes never advertised one (it doesn't re-emit
+    /// `available_commands_update` after `session/load`). Latched — see
+    /// `analyticsReportedSlashFallback`.
+    private func noteSlashCommandFallbackIfNeeded() {
+        guard !analyticsReportedSlashFallback,
+              sessionId != nil,
+              acpCommands.isEmpty else { return }
+        analyticsReportedSlashFallback = true
+        ScarfAnalytics.record("session_resume_fallback", ["kind": "slash_command_fallback"])
+    }
+
+    /// Process a streaming ACP event and update the message list.
+    public func handleACPEvent(_ event: ACPEvent) {
+        // Cross-session guard: drop events that arrived for a session
+        // we're no longer attached to. The previous client's event task
+        // is cancelled fire-and-forget in `stop()` (cancellation is a
+        // signal, not a synchronous join), so a straggling buffered
+        // chunk can land after `vm.reset()` + `setSessionId(new)`. Once
+        // the user sends their first prompt the engagement gate opens
+        // and the stale chunk would otherwise render as a bubble in
+        // the new chat — surfaced in TestFlight feedback as "initial
+        // chat message shows from another chat" (AFI4q5, 2026-05-10).
+        // `.connectionLost` carries no session id and always passes
+        // (it's a transport-level signal, not session-scoped).
+        if let mine = sessionId,
+           let theirs = event.sessionId,
+           theirs != mine {
+            return
+        }
+        // Drop streamed content events until a prompt has been sent in
+        // the currently-attached session. Hermes' ACP adapter sometimes
+        // emits a stream of agent events after `session/load`
+        // (replaying the recent transcript or auto-resuming work for
+        // sessions with persistent goals / queued prompts), which the
+        // user perceives as bubbles materializing one-by-one when they
+        // open an old chat. The DB-fetched history is authoritative for
+        // what's already there; once a prompt is actually sent, live
+        // agent activity flows through normally.
+        //
+        // Non-content events (`availableCommands`, `permissionRequest`,
+        // `connectionLost`) are always processed — they carry session
+        // chrome the user needs regardless of who initiated.
+        //
+        // `promptComplete` is ALSO never gated (S2, 2026-07-13): it is
+        // not part of the replay — the parser never emits it; the send
+        // path synthesizes it from `sendPrompt`'s return — and it
+        // carries the turn's accounting, the `isAgentWorking` clear,
+        // and the no-output failure bubble. Dropping it left a turn
+        // whose gate bookkeeping slipped stuck on "Agent working…"
+        // forever with no failure feedback.
+        if !hasUserSentPromptThisSession {
+            switch event {
+            // Compaction-summary-flagged replay chunks (Hermes v0.20
+            // `_meta.hermes.compactionSummary`) are NOT special-cased
+            // here: the DB-hydrated history is authoritative for them
+            // too — `HermesDataService.messageFromRow` classifies the
+            // persisted rows by their handoff markers and sets the
+            // styling flags there, so letting the replay copies through
+            // would only double-render (or be clobbered by the
+            // subsequent `loadSessionHistory` wholesale replace).
+            case .messageChunk, .userMessageChunk, .thoughtChunk, .toolCallStart,
+                 .toolCallUpdate:
+                ScarfMon.event(.chatStream, "mac.handleACPEvent.preEngagementDropped", count: 1)
+                return
+            case .promptComplete, .permissionRequest, .connectionLost,
+                 .availableCommands, .sessionInfoUpdate, .unknown:
+                break
+            }
+        }
+        switch event {
+        case .messageChunk(_, let text, _, _):
+            appendMessageChunk(text: text)
+        case .userMessageChunk:
+            // `user_message_chunk` only ever carries replayed history
+            // (Scarf never sends a live one, and the pre-engagement
+            // gate above drops replay). Anything that slips through
+            // post-engagement is defensively ignored — the DB-hydrated
+            // history owns replayed user turns.
+            break
+        case .thoughtChunk(_, let text):
+            appendThoughtChunk(text: text)
+        case .toolCallStart(_, let call):
+            handleToolCallStart(call)
+        case .toolCallUpdate(_, let update):
+            handleToolCallComplete(update)
+        case .permissionRequest(_, let requestId, let request):
+            enqueuePermission(PendingPermission(
+                requestId: requestId,
+                title: request.toolCallTitle,
+                kind: request.toolCallKind,
+                options: request.options
+            ))
+        case .promptComplete(_, let response):
+            handlePromptComplete(response: response)
+        case .connectionLost(let reason):
+            handleConnectionLost(reason: reason)
+        case .availableCommands(_, let commands):
+            acpCommands = parseACPCommands(commands)
+        case .sessionInfoUpdate:
+            // The sidebar title mutation is owned by the platform chat VM
+            // (ChatViewModel on Mac / ChatView on iOS), which intercepts
+            // this event in its ACP event loop and updates recentSessions /
+            // sessionPreviews in place. Nothing to do at the rich-transcript
+            // level — the live transcript has no title affordance.
+            break
+        case .unknown:
+            break
+        }
+    }
+
+    private func parseACPCommands(_ commands: [[String: Any]]) -> [HermesSlashCommand] {
+        var result: [HermesSlashCommand] = []
+        for entry in commands {
+            guard let rawName = entry["name"] as? String else { continue }
+            // Hermes sends names either as "compress" or "/compress"
+            let name = rawName.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !name.isEmpty else { continue }
+            let description = (entry["description"] as? String) ?? ""
+            var hint: String? = nil
+            if let input = entry["input"] as? [String: Any],
+               let h = input["hint"] as? String,
+               !h.isEmpty {
+                hint = h
+            }
+            result.append(HermesSlashCommand(
+                name: name,
+                description: description,
+                argumentHint: hint,
+                source: .acp
+            ))
+        }
+        return result
+    }
+
+    /// Load `quick_commands` from `config.yaml` off the main actor and publish
+    /// them as slash commands. Safe to call repeatedly — replaces the existing list.
+    public func loadQuickCommands() {
+        let ctx = context
+        Task.detached { [weak self] in
+            let loaded = Self.loadQuickCommands(context: ctx)
+            let mapped = loaded.map { (name, command) -> HermesSlashCommand in
+                let truncated = command.count > 60
+                    ? String(command.prefix(60)) + "…"
+                    : command
+                return HermesSlashCommand(
+                    name: name,
+                    description: "Run: \(truncated)",
+                    argumentHint: nil,
+                    source: .quickCommand
+                )
+            }
+            await MainActor.run { [weak self] in
+                self?.quickCommands = mapped
+            }
+        }
+    }
+
+    /// Load project-scoped slash commands from
+    /// `<projectPath>/.scarf/slash-commands/` off the main actor and
+    /// publish them. Safe to call repeatedly — replaces the existing
+    /// list (e.g., when the user adds / edits / deletes commands).
+    /// Pass `nil` to clear (e.g., on session de-attribution from a
+    /// project, or quick-chat sessions).
+    public func loadProjectScopedCommands(at projectPath: String?) {
+        guard let projectPath else {
+            projectScopedCommands = []
+            return
+        }
+        let ctx = context
+        Task.detached { [weak self] in
+            let svc = ProjectSlashCommandService(context: ctx)
+            let loaded = svc.loadCommands(at: projectPath)
+            await MainActor.run { [weak self] in
+                self?.projectScopedCommands = loaded
+            }
+        }
+    }
+
+    /// Load the global Scarf slash commands from
+    /// `~/.hermes/scarf/slash-commands/`. Populated by
+    /// `SlashCommandBootstrapService` on app launch; this reads what's
+    /// on disk so user edits (and version bumps from a future app
+    /// release) reach the menu without a relaunch. Safe to call
+    /// repeatedly. Should be called at chat-open time alongside
+    /// `loadProjectScopedCommands`.
+    public func loadGlobalScopedCommands() {
+        let ctx = context
+        Task.detached { [weak self] in
+            let svc = ProjectSlashCommandService(context: ctx)
+            let loaded = svc.loadGlobalCommands()
+            await MainActor.run { [weak self] in
+                self?.globalScopedCommands = loaded
+            }
+        }
+    }
+
+    /// Parse `quick_commands` from `<context>/config.yaml`. Returns
+    /// `[(name, command)]` for every well-formed `type: exec` entry.
+    /// Mac-side `QuickCommandsViewModel` uses a richer model + adds
+    /// an `isDangerous` check; here we only need the slash-menu
+    /// projection, so we keep the parser minimal and ScarfCore-local.
+    nonisolated static func loadQuickCommands(context: ServerContext) -> [(name: String, command: String)] {
+        guard let yaml = context.readText(context.paths.configYAML) else { return [] }
+        // Shared parser (HermesQuickCommandsYAML) so dotted names like
+        // `v1.2_deploy` survive on this side too — the naive
+        // `split(separator: ".", maxSplits: 2)` this used dropped them
+        // from the iOS slash menu while the Mac list showed them.
+        return HermesQuickCommandsYAML.entries(inYAML: yaml).compactMap { entry in
+            guard entry.type == "exec", !entry.command.isEmpty else { return nil }
+            return (name: entry.name, command: entry.command)
+        }
+    }
+
+    private func appendMessageChunk(text: String) {
+        // ScarfMon "first byte" — fires once per turn, on the first
+        // visible message chunk. Splits "user tap → first byte"
+        // (network + Hermes thinking) from "first byte → turn end"
+        // (streaming + Scarf rendering) so we can attribute slow-feel
+        // bugs to the right side. `bytes` carries the first chunk's
+        // size, not the full turn.
+        if streamingAssistantText.isEmpty && currentTurnStart != nil {
+            ScarfMon.event(.chatStream, "firstByte", count: 1, bytes: text.utf8.count)
+        }
+        streamingAssistantText += text
+        // Text is streaming — the growing text bubble is its own
+        // progress signal; the ActivityBubble live status stands down.
+        setLiveActivityStatus(nil)
+        scheduleStreamingUpsert()
+    }
+
+    private func appendThoughtChunk(text: String) {
+        if streamingThinkingText.isEmpty && currentTurnStart != nil {
+            ScarfMon.event(.chatStream, "firstThoughtByte", count: 1, bytes: text.utf8.count)
+        }
+        streamingThinkingText += text
+        if streamingAssistantText.isEmpty {
+            setLiveActivityStatus(.reasoning)
+        }
+        scheduleStreamingUpsert()
+    }
+
+    // MARK: - Live activity status (P2)
+
+    /// Scarf-composed live status for the in-flight turn, shown by the
+    /// trailing ActivityBubble while no visible text is streaming.
+    /// Derived from live ACP events (never from the poll-based
+    /// `sessions.last_activity_description` column, which lags).
+    /// `nil` = no status to show: either the turn hasn't produced its
+    /// first event yet (the classic three-dots indicator covers that
+    /// gap) or visible text is streaming (the text bubble itself is
+    /// the progress signal).
+    public enum LiveActivityStatus: Equatable, Sendable {
+        /// A tool call is executing; payload is its function name.
+        case runningTool(String)
+        /// Thought-stream bytes are arriving with no visible text yet.
+        case reasoning
+        /// Between events — waiting on the model's next output.
+        case receiving
+    }
+
+    public private(set) var liveActivityStatus: LiveActivityStatus?
+
+    /// Equality-guarded setter: `@Observable` fires on every mutation,
+    /// and thought chunks arrive at chunk rate — writing an unchanged
+    /// `.reasoning` per chunk would invalidate the transcript's
+    /// trailing group tens of times per second for nothing.
+    private func setLiveActivityStatus(_ status: LiveActivityStatus?) {
+        guard liveActivityStatus != status else { return }
+        liveActivityStatus = status
+    }
+
+    private func handleToolCallStart(_ call: ACPToolCallEvent) {
+        let toolCall = HermesToolCall(
+            callId: call.toolCallId,
+            functionName: call.functionName,
+            arguments: call.argumentsJSON,
+            startedAt: Date()
+        )
+        streamingToolCalls.append(toolCall)
+        setLiveActivityStatus(.runningTool(call.functionName))
+        // Tally for `agent_turn_completed`'s bucket. Counted at *start* so a
+        // turn cut short by a disconnect still has an honest tally; the
+        // running total survives the per-tool-call `finalizeStreamingMessage`
+        // that clears `streamingToolCalls`.
+        analyticsTurnToolCalls += 1
+        upsertStreamingMessage()
+    }
+
+    private func handleToolCallComplete(_ update: ACPToolCallUpdateEvent) {
+        // Populate live telemetry on the matching streaming call BEFORE
+        // finalizing — once finalize runs, streamingToolCalls is cleared
+        // and the call is locked into the parent HermesMessage's `let
+        // toolCalls`. Mutating here lets `finalizeStreamingMessage()`
+        // promote a HermesToolCall that already carries duration +
+        // exitCode for the inspector to render. No-op for sessions
+        // loaded from `state.db` (no live event ever fires).
+        if let idx = streamingToolCalls.firstIndex(where: { $0.callId == update.toolCallId }) {
+            let started = streamingToolCalls[idx].startedAt
+            if let started {
+                streamingToolCalls[idx].duration = Date().timeIntervalSince(started)
+            }
+            streamingToolCalls[idx].exitCode = Self.exitCode(forStatus: update.status)
+            // Backfill arguments: the `tool_call` start event sometimes
+            // omits `rawInput` (stored as the literal "{}" placeholder);
+            // when the completing update carries the real arguments,
+            // splice them in before finalize locks the call into the
+            // permanent message.
+            let stored = streamingToolCalls[idx].arguments
+            if stored.isEmpty || stored == "{}",
+               let backfilled = update.argumentsJSON {
+                streamingToolCalls[idx].arguments = backfilled
+            }
+        }
+        // Tool finished; until the next event lands we're waiting on
+        // the model again.
+        setLiveActivityStatus(.receiving)
+
+        // Finalize the streaming assistant message (with its tool calls) as a permanent message
+        finalizeStreamingMessage()
+
+        // Add tool result message
+        let id = nextLocalId
+        nextLocalId -= 1
+        messages.append(HermesMessage(
+            id: id,
+            sessionId: sessionId ?? "",
+            role: "tool",
+            content: update.rawOutput ?? update.content,
+            toolCallId: update.toolCallId,
+            toolCalls: [],
+            toolName: nil,
+            timestamp: Date(),
+            tokenCount: nil,
+            finishReason: nil,
+            reasoning: nil
+        ))
+        buildMessageGroups()
+    }
+
+    /// Derive a synthetic exit code from the ACP update event's status
+    /// string. Hermes reports `completed`/`error`/`failed`/`canceled`;
+    /// we collapse to 0 for success, 1 for known-failure variants, nil
+    /// for anything else (so the inspector renders "—" rather than
+    /// fabricating a value).
+    private static func exitCode(forStatus status: String) -> Int? {
+        switch status.lowercased() {
+        case "completed", "success", "ok": return 0
+        case "error", "failed", "canceled", "cancelled": return 1
+        default: return nil
+        }
+    }
+
+    private func handlePromptComplete(response: ACPPromptResult) {
+        // Detect a failed prompt that produced no assistant output — e.g.
+        // Hermes returning `stopReason: "refusal"` when the session was
+        // silently garbage-collected, or `"error"` when the ACP call itself
+        // threw. Without surfacing this, the user sees their prompt sitting
+        // alone under "Agent working…" that never completes with any text.
+        let hadAssistantOutput = streamingAssistantText.isEmpty == false
+            || messages.last?.isAssistant == true
+        finalizeStreamingMessage()
+        // The turn these belong to is over. An unanswered request that
+        // outlived its turn (agent cancelled, tool abandoned, the turn
+        // errored out from under a parallel tool call) must be DROPPED,
+        // not carried into the next turn — otherwise the user gets a
+        // sheet asking them to approve work that already finished, and
+        // answering it goes nowhere. Only reachable when something went
+        // sideways: a healthy turn can't complete while a tool call is
+        // still blocked on approval.
+        clearPendingPermissions()
+
+        if !hadAssistantOutput, response.stopReason != "end_turn" {
+            let reason: String
+            switch response.stopReason {
+            case "refusal":
+                reason = "The agent refused to respond (the session may have been cleared on the server). Try starting a new session from the Session menu."
+            case "error":
+                reason = "The prompt failed — check the ACP error banner above for details."
+            case "max_tokens":
+                reason = "The response was cut off before the agent could produce any output (max_tokens reached before any tokens were emitted)."
+            default:
+                reason = "The prompt ended without a response (stopReason: \(response.stopReason))."
+            }
+            let id = nextLocalId
+            nextLocalId -= 1
+            messages.append(HermesMessage(
+                id: id,
+                sessionId: sessionId ?? "",
+                role: "system",
+                content: reason,
+                toolCallId: nil,
+                toolCalls: [],
+                toolName: nil,
+                timestamp: Date(),
+                tokenCount: nil,
+                finishReason: response.stopReason,
+                reasoning: nil
+            ))
+            // Pass-1 M7 #2: surface the same failure as a top-of-chat
+            // error banner with the stderr tail, so users don't have
+            // to rely solely on the system-message to understand why
+            // nothing happened. The controller registers
+            // `acpStderrProvider`; if absent, the banner still shows
+            // with the hint fallback.
+            Task { await self.recordPromptStopFailureUsingProvider(stopReason: response.stopReason) }
+        }
+
+        // Accumulate token usage from this prompt
+        acpInputTokens += response.inputTokens
+        acpOutputTokens += response.outputTokens
+        acpThoughtTokens += response.thoughtTokens
+        acpCachedReadTokens += response.cachedReadTokens
+        // Compression count is a session-wide running total emitted by
+        // Hermes; each prompt response carries the latest value, so we
+        // replace rather than accumulate. The `max` guard tolerates
+        // pre-v0.13 hosts (which emit 0) being upgraded server-side
+        // mid-session — once a real number lands the count resumes from
+        // there rather than snapping back to 0.
+        acpCompressionCount = max(acpCompressionCount, response.compressionCount)
+        // The turn's one terminal event. `end_turn` is the only success;
+        // everything else maps onto a bounded `error_kind`.
+        endAnalyticsTurn(errorKind: Self.analyticsTurnErrorKind(stopReason: response.stopReason))
+        isAgentWorking = false
+        setLiveActivityStatus(nil)
+        // v2.8 / Hermes v0.13 — Hermes runs the next `/queue`-deferred
+        // prompt server-side now that this turn has settled. Drain the
+        // local mirror FIFO so the header chip count matches what the
+        // user staged. Best-effort: if Hermes' authoritative queue
+        // diverged (deferred prompt aborted, dropped on disconnect),
+        // the chip is one tick stale until the user's next interaction.
+        if !queuedPrompts.isEmpty {
+            popQueuedPrompt()
+        }
+        // TODO(v2.8.1): when this completes after an auto-resumed
+        // checkpoint (Hermes v0.13's "Auto-resume interrupted sessions
+        // after gateway restart"), surface a one-shot "Auto-resumed
+        // from checkpoint" indicator. Wire-shape unknown until a v0.13
+        // dogfooding pass confirms whether the resume lands as a
+        // visible ACP event or is purely server-side. Deferred from
+        // v2.8.0 per WS-2 plan Q3.
+        buildMessageGroups()
+        // Final position after the prompt settles. Catches fast responses
+        // (slash commands, short replies) where `.defaultScrollAnchor(.bottom)`
+        // didn't quite track the abrupt content growth.
+        requestScrollToBottom()
+    }
+
+    private func handleConnectionLost(reason: String) {
+        finalizeStreamingMessage()
+        let id = nextLocalId
+        nextLocalId -= 1
+        messages.append(HermesMessage(
+            id: id,
+            sessionId: sessionId ?? "",
+            role: "system",
+            content: "Connection lost: \(reason). Use the Session menu to start or resume a session.",
+            toolCallId: nil,
+            toolCalls: [],
+            toolName: nil,
+            timestamp: Date(),
+            tokenCount: nil,
+            finishReason: nil,
+            reasoning: nil
+        ))
+        // A turn that died with the connection. No-op if the prompt already
+        // completed and this is the transport noticing afterwards.
+        endAnalyticsTurn(errorKind: "connection_lost")
+        isAgentWorking = false
+        setLiveActivityStatus(nil)
+        clearPendingPermissions()
+        buildMessageGroups()
+    }
+
+    // MARK: - Streaming Message Management
+
+    private static let streamingId = 0
+
+    /// Insert or update the in-progress streaming assistant message (id=0).
+    ///
+    /// On update we preserve the first-seen timestamp; otherwise the
+    /// per-chunk re-stamp would let a finalize race surface as the
+    /// assistant landing ahead of its user prompt in the chronological
+    /// sort (the prompt-jump bug).
+    private func upsertStreamingMessage() {
+        let existingIdx = messages.firstIndex(where: { $0.id == Self.streamingId })
+        let timestamp = existingIdx.map { messages[$0].timestamp } ?? Date()
+        let msg = HermesMessage(
+            id: Self.streamingId,
+            sessionId: sessionId ?? "",
+            role: "assistant",
+            content: streamingAssistantText,
+            toolCallId: nil,
+            toolCalls: streamingToolCalls,
+            toolName: nil,
+            timestamp: timestamp,
+            tokenCount: nil,
+            finishReason: nil,
+            reasoning: streamingThinkingText.isEmpty ? nil : streamingThinkingText
+        )
+
+        if let idx = existingIdx {
+            messages[idx] = msg
+        } else {
+            messages.append(msg)
+        }
+        patchTrailingGroupForStreaming(streamingMsg: msg)
+    }
+
+    /// Per-chunk fast path for `messageGroups` (issue #46). Mutates
+    /// only the trailing group's assistant entry instead of rebuilding
+    /// the entire `messageGroups` array via `buildMessageGroups()` on
+    /// every streamed token.
+    ///
+    /// Falls back to a full rebuild whenever it can't safely patch:
+    ///  - no trailing group exists yet (e.g. first chunk after `reset`)
+    ///  - the trailing group is a user-only group (the very first chunk
+    ///    of a brand-new turn — we need a full rebuild so the assistant
+    ///    is grouped under the right user message)
+    ///
+    /// Other call sites of `buildMessageGroups()` are intentionally
+    /// untouched: they handle structural events (user message, tool
+    /// call complete, finalize, session resume) where group boundaries
+    /// can change, and a full rebuild is the right move there.
+    private func patchTrailingGroupForStreaming(streamingMsg: HermesMessage) {
+        guard let lastIdx = messageGroups.indices.last else {
+            buildMessageGroups()
+            return
+        }
+        let trailing = messageGroups[lastIdx]
+        var assistants = trailing.assistantMessages
+        if let i = assistants.firstIndex(where: { $0.id == Self.streamingId }) {
+            assistants[i] = streamingMsg
+        } else {
+            assistants.append(streamingMsg)
+        }
+        messageGroups[lastIdx] = MessageGroup(
+            id: trailing.id,
+            userMessage: trailing.userMessage,
+            assistantMessages: assistants,
+            toolResults: trailing.toolResults
+        )
+    }
+
+    /// Convert the streaming message (id=0) into a permanent message and reset streaming state.
+    private func finalizeStreamingMessage() {
+        ScarfMon.measure(.chatStream, "finalizeStreamingMessage") {
+            _finalizeStreamingMessageImpl()
+        }
+    }
+
+    private func _finalizeStreamingMessageImpl() {
+        guard let idx = messages.firstIndex(where: { $0.id == Self.streamingId }) else { return }
+
+        // Only finalize if there's actual content
+        let hasContent = !streamingAssistantText.isEmpty
+            || !streamingThinkingText.isEmpty
+            || !streamingToolCalls.isEmpty
+
+        // ScarfMon — surface turns that finalize with NO visible
+        // assistant text. Common Nous-model failure mode: model
+        // emits a few thought-stream bytes then falls silent;
+        // Hermes finalizes with empty content; the user sees a
+        // stuck "(°□°) deliberating..." placeholder bubble. The
+        // event fires for both the all-empty case (which gets
+        // removed below) and the thoughts-only case (which is
+        // kept as a permanent message with empty body) — both
+        // are user-visible failures worth tracking.
+        if streamingAssistantText.isEmpty && streamingToolCalls.isEmpty {
+            ScarfMon.event(
+                .chatStream,
+                "emptyAssistantTurn",
+                count: 1,
+                bytes: streamingThinkingText.utf8.count
+            )
+        }
+
+        if hasContent {
+            let id = nextLocalId
+            nextLocalId -= 1
+            // Wrap the streaming-id rewrite in a no-animation
+            // transaction. Without this SwiftUI sees an identity
+            // change for the streaming ForEach element (id 0 → new
+            // permanent id) and runs an animated diff against
+            // adjacent elements, which costs ~5–8 RichMessageBubble
+            // body re-evaluations per turn-end (visible in the
+            // ScarfMon ring as a 1–2 ms burst right after every
+            // `finalizeStreamingMessage` interval). The new message
+            // is content-equal to the streaming one — there is no
+            // animation worth running.
+            // Preserve the streaming message's original timestamp.
+            // Re-stamping with `Date()` here used to let a polling tick
+            // that landed mid-finalize push the assistant's chronology
+            // ahead of its actual position — the prompt-jump bug.
+            let preservedTimestamp = messages[idx].timestamp ?? Date()
+            withTransaction(Transaction(animation: nil)) {
+                messages[idx] = HermesMessage(
+                    id: id,
+                    sessionId: sessionId ?? "",
+                    role: "assistant",
+                    content: streamingAssistantText,
+                    toolCallId: nil,
+                    toolCalls: streamingToolCalls,
+                    toolName: nil,
+                    timestamp: preservedTimestamp,
+                    tokenCount: nil,
+                    finishReason: streamingToolCalls.isEmpty ? "stop" : nil,
+                    reasoning: streamingThinkingText.isEmpty ? nil : streamingThinkingText
+                )
+            }
+            // Capture per-turn duration so the chat UI can render the
+            // stopwatch pill (v2.5). Skips assistants we don't have a
+            // start time for — e.g., the .promptComplete fired but the
+            // turn began before this VM was constructed (shouldn't
+            // happen in practice but guards an edge case).
+            if let start = currentTurnStart {
+                turnDurations[id] = Date().timeIntervalSince(start)
+                currentTurnStart = nil
+            }
+        } else {
+            // Remove empty streaming placeholder. Same no-animation
+            // transaction pattern — empty-finalize used to ripple the
+            // ForEach diff to every following bubble.
+            withTransaction(Transaction(animation: nil)) {
+                _ = messages.remove(at: idx)
+            }
+        }
+
+        // Reset streaming state for next chunk
+        streamingAssistantText = ""
+        streamingThinkingText = ""
+        streamingToolCalls = []
+        cancelStreamingFlush()
+    }
+
+    // MARK: - Disconnect Recovery
+
+    /// Finalize streaming state on disconnect, before reconnection attempts begin.
+    /// Saves partial content as a permanent message without adding a system message.
+    public func finalizeOnDisconnect() {
+        finalizeStreamingMessage()
+        isAgentWorking = false
+        setLiveActivityStatus(nil)
+        clearPendingPermissions()
+        buildMessageGroups()
+    }
+
+    /// Reconcile in-memory messages with DB state after a successful reconnection.
+    /// Merges DB-persisted messages with any local-only messages (e.g., user messages
+    /// that the ACP process may not have persisted before crashing).
+    public func reconcileWithDB(sessionId: String) async {
+        let opened = await dataService.open()
+        guard opened else { return }
+
+        // Reconnects don't generate hundreds of unseen messages, so a
+        // 200-row tail is plenty for the merge — and it keeps us from
+        // re-materializing 1000+ message sessions on every reconnect.
+        var dbMessages = await dataService.fetchMessages(sessionId: sessionId, limit: HistoryPageSize.reconcile)
+
+        // If we have an origin session (CLI session continued via ACP),
+        // include those messages too
+        if let origin = originSessionId, origin != sessionId {
+            let originMessages = await dataService.fetchMessages(sessionId: origin, limit: HistoryPageSize.reconcile)
+            if !originMessages.isEmpty {
+                dbMessages = originMessages + dbMessages
+                dbMessages.sort(by: HermesMessage.chronologicalOrder)
+            }
+        }
+
+        let session = await dataService.fetchSession(id: sessionId)
+        await dataService.close()
+
+        // Find local-only user messages not yet in DB.
+        // Local messages have negative IDs; DB messages have positive IDs.
+        let dbUserContents = Set(dbMessages.filter(\.isUser).map(\.content))
+        let localOnlyMessages = messages.filter { msg in
+            msg.id < 0 && msg.isUser && !dbUserContents.contains(msg.content)
+        }
+
+        // Build reconciled list: DB messages + unmatched local user messages
+        var reconciled = dbMessages
+        for localMsg in localOnlyMessages {
+            if let ts = localMsg.timestamp,
+               let insertIdx = reconciled.firstIndex(where: { ($0.timestamp ?? .distantPast) > ts }) {
+                reconciled.insert(localMsg, at: insertIdx)
+            } else {
+                reconciled.append(localMsg)
+            }
+        }
+
+        messages = reconciled
+        currentSession = session
+        let minId = reconciled.map(\.id).min() ?? 0
+        nextLocalId = min(minId - 1, -1)
+        buildMessageGroups()
+    }
+
+    // MARK: - Load History from DB (for resumed sessions)
+
+    /// Load message history from the DB, optionally combining an origin session
+    /// (e.g., CLI session) with the current ACP session.
+    public func loadSessionHistory(sessionId: String, acpSessionId: String? = nil) async {
+        await ScarfMon.measureAsync(.sessionLoad, "mac.hydrateMessages") {
+        self.sessionId = sessionId
+        // Capture the session-id we're loading FOR so we can verify
+        // it's still the active one before assigning to `messages`.
+        // Without this guard, switching to a small chat while a
+        // larger one is mid-fetch can result in last-write-wins:
+        // the slow fetch finishes after the small chat's, drops
+        // the user back into the big chat's transcript, and the
+        // user has to reselect the small one. Observed in remote
+        // perf captures (parallel fetchMessages calls, one timing
+        // out at 30s for a 157-message session, the other 2-message
+        // chat completing in 425ms; the 30s one's assignment
+        // overwrote the small chat).
+        let loadingForSession = sessionId
+        // Force a fresh snapshot pull on remote contexts. An earlier open()
+        // would have cached a stale copy — on resume we need whatever
+        // Hermes has actually persisted since then, or the resumed session
+        // will show only history up to the moment the snapshot was taken.
+        // `forceFresh: true` refuses the stale-snapshot fallback the data
+        // service grew in M11 — falling back here would silently hide
+        // messages the agent streamed during the user's offline window.
+        let opened = await dataService.refresh(forceFresh: true)
+        guard opened else { return }
+        // Race-check #1: session id may have changed during refresh.
+        guard self.sessionId == loadingForSession else {
+            ScarfMon.event(.sessionLoad, "mac.hydrateMessages.dropped", count: 1)
+            return
+        }
+
+        // v2.8 two-phase loader. Phase 1 — skeleton: user + assistant
+        // rows only, no tool_calls JSON, no reasoning, no
+        // reasoning_content. Wire payload bounded by conversational
+        // text alone so chats with multi-page tool result blobs (the
+        // 30s-timeout case) come up in seconds. Phase 2 (kicked off
+        // below in a Task.detached) fills tool calls + tool results in
+        // the background — the chat is usable while it runs.
+        let pageSize = HistoryPageSize.initial
+        let originOutcome = await dataService.fetchSkeletonMessages(sessionId: sessionId, limit: pageSize)
+        var allMessages = originOutcome.messages
+        var transportFailure: String? = originOutcome.transportError
+        // Race-check #2: session id may have changed during the
+        // long fetch (the most common race — a 30s timeout on a
+        // big session lets the user switch to a small one and back).
+        guard self.sessionId == loadingForSession else {
+            ScarfMon.event(.sessionLoad, "mac.hydrateMessages.dropped", count: 1)
+            return
+        }
+        // The DB has more on-disk history when the initial fetch
+        // saturated the limit. The "Load earlier" affordance reads
+        // this flag.
+        var moreHistory = allMessages.count >= pageSize
+        let session = await dataService.fetchSession(id: sessionId)
+
+        // If the ACP session is different from the origin, load its messages too
+        // and combine them chronologically
+        if let acpId = acpSessionId, acpId != sessionId {
+            originSessionId = sessionId
+            self.sessionId = acpId
+            let acpOutcome = await dataService.fetchSkeletonMessages(sessionId: acpId, limit: pageSize)
+            // Race-check #3: same guard, after the second fetch.
+            guard self.sessionId == acpId else {
+                ScarfMon.event(.sessionLoad, "mac.hydrateMessages.dropped", count: 1)
+                return
+            }
+            if let acpErr = acpOutcome.transportError, transportFailure == nil {
+                transportFailure = acpErr
+            }
+            if !acpOutcome.messages.isEmpty {
+                allMessages.append(contentsOf: acpOutcome.messages)
+                allMessages.sort(by: HermesMessage.chronologicalOrder)
+                moreHistory = moreHistory || acpOutcome.messages.count >= pageSize
+            }
+        }
+
+        // Issue #63 — re-inject any locally-created user messages
+        // we still have on file for this session that haven't yet
+        // shown up in state.db. Covers two paths:
+        //   1. The user just sent a prompt then resumed a different
+        //      session before Hermes persisted the row. `reset()` had
+        //      cleared `messages` but the per-session pending cache
+        //      survived; restore the row here so the bubble doesn't
+        //      come back blank.
+        //   2. The DB-resume path on first load — a previously-pending
+        //      message Hermes is still mid-write may not appear in
+        //      this fetch. We merge it in, and drop it from the cache
+        //      as soon as a matching DB row (same content, persisted
+        //      id ≥ 0) shows up.
+        let pendingForSession = pendingLocalUserMessages[sessionId] ?? []
+        if pendingForSession.isEmpty {
+            messages = allMessages
+        } else {
+            var merged = allMessages
+            var stillPending: [HermesMessage] = []
+            for local in pendingForSession {
+                let persisted = merged.contains { msg in
+                    msg.isUser && msg.id >= 0 && msg.content == local.content
+                }
+                if persisted {
+                    continue // DB caught up — drop the local copy
+                }
+                if !merged.contains(where: { $0.id == local.id }) {
+                    merged.append(local)
+                }
+                stillPending.append(local)
+            }
+            merged.sort(by: HermesMessage.chronologicalOrder)
+            messages = merged
+            if stillPending.isEmpty {
+                pendingLocalUserMessages.removeValue(forKey: sessionId)
+            } else {
+                pendingLocalUserMessages[sessionId] = stillPending
+            }
+        }
+        currentSession = session
+        let minId = messages.map(\.id).min() ?? 0
+        nextLocalId = min(minId - 1, -1)
+        // Track the oldest loaded id from THIS session (not the merged
+        // origin) so `loadEarlier()` pages back through the live ACP
+        // session's history. Cross-session backfill (paging into the
+        // CLI origin) isn't supported in v1 — the merged 2× pageSize
+        // is enough headroom for the dashboard-resume case.
+        let currentSessionId = self.sessionId ?? sessionId
+        oldestLoadedMessageID = allMessages
+            .filter { $0.sessionId == currentSessionId }
+            .map(\.id)
+            .min()
+        hasMoreHistory = moreHistory
+        ScarfMon.event(.sessionLoad, "mac.hydrateMessages.rows", count: messages.count)
+        buildMessageGroups()
+        // Session activation: `.defaultScrollAnchor(.bottom)` only fires
+        // on initial ScrollView mount. When the user activates a
+        // different session while the chat surface stays on screen,
+        // the existing ScrollView keeps its prior offset and the new
+        // transcript appears wherever the last one happened to scroll
+        // to. Bump the trigger so the bottom sentinel re-anchors —
+        // mirrors the `addUserMessage` / `handlePromptComplete` bumps.
+        requestScrollToBottom()
+
+        // Partial-result detection — if a fetch tripped a transport
+        // failure (SSH timeout / ControlMaster drop) the user is now
+        // looking at zero or near-zero messages with no idea why. The
+        // pre-v2.8 behavior was a silent empty transcript. Surface a
+        // banner via the existing acpError triplet so the user sees
+        // "couldn't load full history — connection slow." We assume
+        // more history exists (so the "Load earlier" affordance is
+        // honest about the gap) — caller can retry by reopening the
+        // session.
+        if let reason = transportFailure {
+            // The user is looking at a partial (often empty) transcript
+            // because the fetch tripped a transport failure. One event per
+            // load attempt; the reason string itself never leaves this scope.
+            ScarfAnalytics.record("session_resume_fallback", ["kind": "history_fallback"])
+            acpError = "Couldn't load full chat history — the connection to \(dataService.context.displayName) timed out."
+            acpErrorHint = "Reopen the session to retry, or check the SSH link if this keeps happening."
+            acpErrorDetails = reason
+            acpErrorOAuthProvider = nil
+            hasMoreHistory = true
+        } else if messages.isEmpty {
+            // No transport failure, but the resume still produced nothing to
+            // read — the session's rows aren't in `state.db` (a session
+            // garbage-collected server-side, or one that never persisted).
+            // Distinct from `history_fallback`: nothing failed, the history
+            // simply isn't there.
+            ScarfAnalytics.record("session_resume_fallback", ["kind": "sparse_transcript"])
+            startToolHydration(loadingForSession: self.sessionId ?? sessionId)
+        } else {
+            // v2.8 — kick off background hydration of tool_calls JSON
+            // and tool result rows for the just-loaded skeleton.
+            // Non-blocking on the main load path (chat is usable).
+            startToolHydration(loadingForSession: self.sessionId ?? sessionId)
+        }
+        } // end measureAsync(.sessionLoad, "mac.hydrateMessages")
+    }
+
+    /// Phase 2 of the two-phase chat loader. Pulls `tool_calls` JSON
+    /// for the loaded assistant rows, then fetches `role='tool'` rows
+    /// in the loaded id range and splices both into `messages` /
+    /// `messageGroups` without disturbing what the user is already
+    /// reading. Cancellable — restarting (a session switch, a
+    /// `reset()`) drops any in-flight pass.
+    ///
+    /// Tool calls go in first because they live ON the existing
+    /// assistant message and surface the most-visible UI affordance
+    /// (the tool card chips). Tool result content rows go in second
+    /// because they're the heaviest payload and the UI degrades
+    /// gracefully without them (the cards still show "running" /
+    /// "complete" state; only the result body is missing).
+    private func startToolHydration(loadingForSession: String) {
+        hydrationTask?.cancel()
+        let sessionForLoad = loadingForSession
+        let dataService = self.dataService
+        hydrationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isHydratingTools = true
+            defer { self.isHydratingTools = false }
+
+            // Snapshot the assistant ids + id range from the messages
+            // we just loaded. Doing this on MainActor keeps us in step
+            // with the observable view of `messages`; the actual
+            // SQL calls happen in `await` slots that release the actor.
+            let assistantIds = self.messages
+                .filter { $0.isAssistant && $0.id > 0 }
+                .map(\.id)
+            guard let minId = self.messages.map(\.id).min(),
+                  let maxId = self.messages.map(\.id).max(),
+                  !assistantIds.isEmpty || minId < maxId else {
+                return
+            }
+
+            // Phase 2a — tool_calls JSON. Splice parsed values into
+            // each assistant message that has them.
+            let toolCallMap = await dataService.hydrateAssistantToolCalls(messageIds: assistantIds)
+            if Task.isCancelled || self.sessionId != sessionForLoad {
+                ScarfMon.event(.sessionLoad, "mac.hydrateTools.dropped", count: 1)
+                return
+            }
+            if !toolCallMap.isEmpty {
+                self.messages = self.messages.map { msg in
+                    guard msg.isAssistant, let calls = toolCallMap[msg.id] else { return msg }
+                    return msg.withToolCalls(calls)
+                }
+                self.buildMessageGroups()
+            }
+
+            // Phase 2b — tool result rows. Default OFF (v2.8). A
+            // single tool result blob (file dump, stack trace) can run
+            // hundreds of KB; bulk-fetching all of them during chat
+            // resume on a slow remote was the cause of the 30s timeout
+            // observed in 2026-05-05 dogfooding. Users can opt in via
+            // Settings → Display → "Load tool results in past chats"
+            // when bandwidth is plentiful. Tool call CARDS still
+            // render either way (`tool_calls` JSON loads in Phase 2a);
+            // only the inspector pane's "Output" section is empty
+            // until the user opens a card, at which point a per-call
+            // lazy fetch fills it in.
+            let loadResults = UserDefaults.standard.bool(
+                forKey: Self.loadHistoricalToolResultsKey
+            )
+            guard loadResults else {
+                ScarfMon.event(.sessionLoad, "mac.hydrateTools.skippedToolResults", count: 1)
+                return
+            }
+            let toolResults = await dataService.fetchToolResultsInRange(
+                sessionId: sessionForLoad,
+                minId: minId,
+                maxId: maxId
+            )
+            if Task.isCancelled || self.sessionId != sessionForLoad {
+                ScarfMon.event(.sessionLoad, "mac.hydrateTools.dropped", count: 1)
+                return
+            }
+            if !toolResults.isEmpty {
+                var merged = self.messages
+                let existingIds = Set(merged.map(\.id))
+                for tr in toolResults where !existingIds.contains(tr.id) {
+                    merged.append(tr)
+                }
+                merged.sort { lhs, rhs in
+                    let lt = lhs.timestamp ?? .distantPast
+                    let rt = rhs.timestamp ?? .distantPast
+                    if lt != rt { return lt < rt }
+                    return lhs.id < rhs.id
+                }
+                self.messages = merged
+                self.buildMessageGroups()
+            }
+            ScarfMon.event(.sessionLoad, "mac.hydrateTools.complete", count: 1)
+        }
+    }
+
+    /// Lazy-load the rich `reasoning_content` (v0.11) for a settled
+    /// message on demand. The bulk/skeleton fetch excludes it (issue #74)
+    /// and carries only the lighter `reasoning` channel, so the chat bubble
+    /// upgrades to the full chain-of-thought when the user opens the
+    /// REASONING disclosure. Returns nil on pre-v0.11 hosts or when the
+    /// message has no reasoning_content. (t-aud21)
+    @MainActor
+    public func reasoningContent(for messageId: Int) async -> String? {
+        await dataService.fetchReasoningContent(for: messageId)
+    }
+
+    /// Lazy-load the content of a single tool result by call id and
+    /// splice it into `messages` / `messageGroups` as a synthetic
+    /// `role='tool'` row. Used by `ChatInspectorPane` when the user
+    /// opens a tool call card whose result hasn't been hydrated yet
+    /// (auto-hydrate is opt-in via `loadHistoricalToolResultsKey`).
+    /// No-op when the result is already present in the transcript or
+    /// the session id has changed underneath us.
+    @MainActor
+    public func loadToolResultIfMissing(callId: String) async {
+        guard let sessionForLoad = sessionId else { return }
+        // Already in the transcript? Done.
+        if messages.contains(where: { $0.toolCallId == callId && $0.isToolResult }) {
+            return
+        }
+        guard let content = await dataService.fetchToolResult(callId: callId) else {
+            return
+        }
+        guard self.sessionId == sessionForLoad else { return }
+        // Build a synthetic tool result row. We don't have the original
+        // row id (would need a second SELECT) so we use a negative
+        // local id that won't collide with persisted rows. The bubble
+        // and inspector both key on `toolCallId`, not `id`, for tool
+        // results — so this is enough to render correctly.
+        let placeholderId = nextLocalId
+        nextLocalId -= 1
+        let synthetic = HermesMessage(
+            id: placeholderId,
+            sessionId: sessionForLoad,
+            role: "tool",
+            content: content,
+            toolCallId: callId,
+            toolCalls: [],
+            toolName: nil,
+            timestamp: Date(),
+            tokenCount: nil,
+            finishReason: nil,
+            reasoning: nil,
+            reasoningContent: nil
+        )
+        messages.append(synthetic)
+        // Re-sort so the tool result lands next to its assistant
+        // parent. ID-based ordering preserves the chronological order
+        // of all the persisted rows; the synthetic placeholder uses a
+        // negative id so it slots in last — fine for inspector display
+        // since the inspector keys on toolCallId.
+        messages.sort(by: HermesMessage.chronologicalOrder)
+        buildMessageGroups()
+        ScarfMon.event(.sessionLoad, "mac.lazyToolResult.fetched", count: 1)
+    }
+
+    // MARK: - Load Earlier (pagination)
+
+    /// Page back through the current session's DB-persisted history
+    /// before `oldestLoadedMessageID` and prepend the page to
+    /// `messages`. Cheap on the SQLite side (`id` is the primary
+    /// key); the cost is the data-service `open()` round-trip on
+    /// remote contexts. `pageSize` defaults to the same 200-row
+    /// budget as the initial load.
+    public func loadEarlier(pageSize: Int = HistoryPageSize.initial) async {
+        guard !isLoadingEarlier, hasMoreHistory else { return }
+        guard let sessionId, let oldest = oldestLoadedMessageID else { return }
+        isLoadingEarlier = true
+        defer { isLoadingEarlier = false }
+
+        let opened = await dataService.open()
+        guard opened else { return }
+
+        // Paged-in history renders in recall mode (prompts + text
+        // replies + one activity marker per turn — Alan, 2026-09-03),
+        // so a page that contains NOTHING renderable (pure junk rows)
+        // must not strand the user with a cleared spinner and no
+        // visible change. Keep fetching — bounded — until a page
+        // yields renderable content or the table is exhausted; either
+        // way `isLoadingEarlier` clears (defer) and the state machine
+        // settles. Never an infinite spinner by construction.
+        var cursor = oldest
+        var accumulated: [HermesMessage] = []
+        for _ in 0..<Self.maxEarlierPageFetches {
+            let page = await dataService.fetchMessages(
+                sessionId: sessionId,
+                limit: pageSize,
+                before: cursor
+            )
+            guard !page.isEmpty else {
+                hasMoreHistory = false
+                break
+            }
+            accumulated = page + accumulated
+            cursor = page.first?.id ?? cursor
+            // Fewer rows than the page size → bottom of the table.
+            if page.count < pageSize { hasMoreHistory = false }
+            if Self.pageHasRenderableContent(page) || !hasMoreHistory { break }
+        }
+        guard !accumulated.isEmpty else { return }
+
+        // First successful page marks the recall-mode boundary: every
+        // row older than what the session open loaded renders text-only.
+        if earlierHistoryCutoffId == nil {
+            earlierHistoryCutoffId = oldest
+        }
+        messages.insert(contentsOf: accumulated, at: 0)
+        oldestLoadedMessageID = accumulated.first?.id
+        buildMessageGroups()
+    }
+
+    /// Bound on back-to-back page fetches inside one `loadEarlier`
+    /// call when pages keep coming back with nothing renderable.
+    static let maxEarlierPageFetches = 5
+
+    /// Whether a fetched history page contains anything the recall-mode
+    /// renderer can show: a user prompt, visible assistant text, tool
+    /// calls or reasoning (drawn as the activity marker), or the
+    /// Hermes "(empty)" sentinel (drawn as the muted empty-response row).
+    nonisolated static func pageHasRenderableContent(_ page: [HermesMessage]) -> Bool {
+        page.contains { msg in
+            msg.isUser
+                || msg.hasVisibleText
+                || !msg.toolCalls.isEmpty
+                || msg.hasVisibleReasoning
+                || msg.isEmptyResponseSentinel
+        }
+    }
+
+    // MARK: - DB Polling (terminal mode fallback)
+
+    public func markAgentWorking() {
+        isAgentWorking = true
+        userSendPending = true
+        startActivePolling()
+    }
+
+    /// Unwind `markAgentWorking()` for a send that never reached Hermes —
+    /// e.g. the Bot Chat CLI transport's delivery subprocess failed before
+    /// the agent saw the prompt. Without this the poll loop spins forever
+    /// waiting for a user row that will never appear in `state.db`
+    /// (`userSendPending` only clears when the DB echoes the message), and
+    /// the composer stays in its "agent is working" state.
+    public func cancelPendingSend() {
+        userSendPending = false
+        isAgentWorking = false
+        stopActivePolling()
+    }
+
+    public func scheduleRefresh() {
+        debounceTask?.cancel()
+        debounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            guard !Task.isCancelled else { return }
+            await self?.refreshMessages()
+        }
+    }
+
+    public func refreshMessages() async {
+        // Polling tick (terminal mode): pull a fresh snapshot so remote
+        // reflects Hermes writes since the last tick. On local this is a
+        // cheap reopen of the live DB.
+        let opened = await dataService.refresh()
+        guard opened else { return }
+
+        if sessionId == nil {
+            if let resetTime = resetTimestamp {
+                if let candidate = await dataService.fetchMostRecentlyStartedSessionId(after: resetTime) {
+                    sessionId = candidate
+                }
+            }
+            if sessionId == nil {
+                sessionId = await dataService.fetchMostRecentlyActiveSessionId()
+            }
+        }
+
+        guard let sessionId else { return }
+
+        let fingerprint = await dataService.fetchMessageFingerprint(sessionId: sessionId)
+
+        if fingerprint != lastKnownFingerprint {
+            let fetched = await dataService.fetchMessages(sessionId: sessionId, limit: HistoryPageSize.polling)
+            let session = await dataService.fetchSession(id: sessionId)
+            lastKnownFingerprint = fingerprint
+
+            messages = Self.mergedAfterPoll(fetched: fetched, currentLocal: messages)
+            currentSession = session
+            buildMessageGroups()
+
+            let derivedWorking = deriveAgentWorking(from: fetched)
+            if userSendPending {
+                if fetched.last?.isUser == true {
+                    userSendPending = false
+                }
+                isAgentWorking = true
+            } else {
+                let wasWorking = isAgentWorking
+                isAgentWorking = derivedWorking
+                if wasWorking && !derivedWorking {
+                    stopActivePolling()
+                }
+            }
+        }
+    }
+
+    /// Merge a polling-tick DB snapshot with the current in-memory
+    /// state, preserving local-only rows (streaming chunk, optimistic
+    /// user msg, optimistic tool-result placeholder) whose semantic
+    /// twin hasn't yet appeared in `fetched`.
+    ///
+    /// Without this guard the bare `messages = fetched` swap at line
+    /// ~1724 would briefly drop the streaming bubble or a tool result
+    /// placeholder that Hermes hasn't committed to `state.db` yet —
+    /// visible as the prompt-jump symptom (issue tracked alongside
+    /// the v2.7-era ordering rework).
+    nonisolated static func mergedAfterPoll(
+        fetched: [HermesMessage],
+        currentLocal: [HermesMessage]
+    ) -> [HermesMessage] {
+        let dbUserContents = Set(fetched.filter(\.isUser).map(\.content))
+        let dbToolCallIds = Set(fetched.compactMap { $0.role == "tool" ? $0.toolCallId : nil })
+        var merged = fetched
+        for msg in currentLocal {
+            // Persisted DB rows always have positive ids; only locals
+            // (negative id) and the streaming chunk (id == 0) qualify
+            // for survival.
+            guard msg.id <= 0 else { continue }
+            if msg.id == 0 {
+                // Streaming assistant — DB never carries id == 0, so
+                // this is always purely local. Keep until finalize
+                // flips it to a negative permanent id.
+                merged.append(msg)
+                continue
+            }
+            if msg.isUser, !dbUserContents.contains(msg.content) {
+                merged.append(msg)
+                continue
+            }
+            if msg.role == "tool", let callId = msg.toolCallId, !dbToolCallIds.contains(callId) {
+                merged.append(msg)
+                continue
+            }
+        }
+        merged.sort(by: HermesMessage.chronologicalOrder)
+        return merged
+    }
+
+    private func startActivePolling() {
+        stopActivePolling()
+        activePollingTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refreshMessages()
+            }
+        }
+    }
+
+    private func stopActivePolling() {
+        activePollingTimer?.invalidate()
+        activePollingTimer = nil
+    }
+
+    private func deriveAgentWorking(from fetched: [HermesMessage]) -> Bool {
+        guard let last = fetched.last else { return false }
+        if last.isUser { return true }
+        if last.isToolResult { return true }
+        if last.isAssistant {
+            if !last.toolCalls.isEmpty {
+                let allCallIds = Set(last.toolCalls.map(\.callId))
+                let resultCallIds = Set(fetched.compactMap { $0.isToolResult ? $0.toolCallId : nil })
+                return !allCallIds.subtracting(resultCallIds).isEmpty
+            }
+            return last.finishReason == nil
+        }
+        return false
+    }
+
+    // MARK: - Message Grouping
+
+    private func buildMessageGroups() {
+        messageGroups = Self.buildGroups(from: messages)
+    }
+
+    /// Pure grouping pass over a chronological message array — extracted
+    /// static so DB-history shapes (no user echo, no id-0 streaming row)
+    /// can be exercised directly in tests.
+    nonisolated static func buildGroups(from messages: [HermesMessage]) -> [MessageGroup] {
+        var groups: [MessageGroup] = []
+        var currentUser: HermesMessage?
+        var currentAssistant: [HermesMessage] = []
+        var currentToolResults: [String: HermesMessage] = [:]
+        var groupIndex = 0
+
+        func flushGroup() {
+            if currentUser != nil || !currentAssistant.isEmpty {
+                // Use stable sequential IDs so SwiftUI doesn't re-create views
+                // when streaming messages finalize (id changes from 0 to -N)
+                groups.append(MessageGroup(
+                    id: groupIndex,
+                    userMessage: currentUser,
+                    assistantMessages: currentAssistant,
+                    toolResults: currentToolResults
+                ))
+                groupIndex += 1
+            }
+            currentUser = nil
+            currentAssistant = []
+            currentToolResults = [:]
+        }
+
+        for message in messages {
+            if message.isUser {
+                flushGroup()
+                currentUser = message
+            } else if message.isToolResult {
+                if let callId = message.toolCallId {
+                    currentToolResults[callId] = message
+                }
+                currentAssistant.append(message)
+            } else {
+                // A user-less run of assistants used to split at EVERY
+                // assistant boundary, which shattered a DB-loaded tool
+                // loop into one single-call group per row — each
+                // rendering its own "1 tools" ActivityBubble with no
+                // cross-message ×N collapse (ShabuBox SEO session,
+                // 2026-09-02). Only a VISIBLE-TEXT assistant starts a
+                // new user-less group now; activity-only rows (tool
+                // calls, thoughts-only, blank, or the Hermes "(empty)"
+                // sentinel) accumulate so `transcriptItems` can
+                // aggregate the whole run into one segment.
+                if currentUser == nil && !currentAssistant.isEmpty
+                    && message.isAssistant && message.hasVisibleText {
+                    flushGroup()
+                }
+                currentAssistant.append(message)
+            }
+        }
+        flushGroup()
+
+        return groups
+    }
+}
+
+#endif // canImport(SQLite3)

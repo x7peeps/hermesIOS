@@ -1,0 +1,376 @@
+import SwiftUI
+import ScarfCore
+import ScarfDesign
+import AppKit
+
+struct WebhooksView: View {
+    // Coordinator-cached (t-aud24) so it survives section switches.
+    let viewModel: WebhooksViewModel
+    @State private var showAddSheet = false
+    @State private var pendingRemove: HermesWebhook?
+
+    init(viewModel: WebhooksViewModel) {
+        self.viewModel = viewModel
+    }
+
+
+    // Add form state
+    @State private var addName = ""
+    @State private var addPrompt = ""
+    @State private var addEvents = ""
+    @State private var addDescription = ""
+    @State private var addSkills = ""
+    @State private var addDeliver = "log"
+    @State private var addChatID = ""
+    @State private var addSecret = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            if viewModel.isLoading && viewModel.webhooks.isEmpty {
+                ProgressView().padding()
+            } else if viewModel.webhookPlatformNotEnabled {
+                setupRequiredState
+            } else if viewModel.webhooks.isEmpty {
+                emptyState
+            } else {
+                list
+            }
+        }
+        .background(ScarfColor.backgroundPrimary)
+        .navigationTitle("Webhooks")
+        .onAppear { viewModel.load() }
+        .sheet(isPresented: $showAddSheet) { addSheet }
+        .sheet(item: Binding(
+            get: { viewModel.createdSecret },
+            set: { if $0 == nil { viewModel.createdSecret = nil } }
+        )) { created in
+            createdSecretSheet(created)
+        }
+        .confirmationDialog(
+            pendingRemove.map { "Remove webhook \($0.name)?" } ?? "",
+            isPresented: Binding(get: { pendingRemove != nil }, set: { if !$0 { pendingRemove = nil } })
+        ) {
+            Button("Remove", role: .destructive) {
+                if let w = pendingRemove { viewModel.remove(w) }
+                pendingRemove = nil
+            }
+            Button("Cancel", role: .cancel) { pendingRemove = nil }
+        }
+    }
+
+    private var header: some View {
+        ScarfPageHeader(
+            "Webhooks",
+            subtitle: "HTTP receivers that trigger sessions on incoming events."
+        ) {
+            HStack(spacing: ScarfSpace.s2) {
+                if let msg = viewModel.message {
+                    // Three seals, not two (P54b): an exit-0 run that
+                    // proved nothing is neutral amber with a question mark,
+                    // never the refusal's triangle.
+                    Label(
+                        msg,
+                        systemImage: viewModel.messageIsUnconfirmed
+                            ? "questionmark.circle.fill"
+                            : (viewModel.messageIsError
+                               ? "exclamationmark.triangle.fill"
+                               : "info.circle.fill")
+                    )
+                    .scarfStyle(.caption)
+                    .foregroundStyle(
+                        viewModel.messageIsError
+                            ? ScarfColor.danger
+                            : (viewModel.messageIsUnconfirmed
+                               ? ScarfColor.warning : ScarfColor.success))
+                }
+                Button("Reload") { viewModel.load(force: true) }
+                    .buttonStyle(ScarfGhostButton())
+                Button {
+                    resetAddForm()
+                    showAddSheet = true
+                } label: {
+                    Label("Subscribe", systemImage: "plus")
+                }
+                .buttonStyle(ScarfPrimaryButton())
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    /// Shown when hermes reports the webhook platform isn't enabled. Direct users
+    /// to the interactive setup wizard instead of showing a misleading empty list.
+    private var setupRequiredState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.largeTitle)
+                .foregroundStyle(.orange)
+            Text("Webhook platform not enabled")
+                .font(.title3.bold())
+            Text("Hermes needs a global webhook secret and port before subscriptions can receive traffic. Run the gateway setup wizard or edit ~/.hermes/config.yaml manually.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 500)
+            HStack(spacing: 8) {
+                Button {
+                    openGatewaySetupInTerminal()
+                } label: {
+                    Label("Run Setup in Terminal", systemImage: "terminal")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                Button {
+                    viewModel.context.openInLocalEditor(viewModel.context.paths.configYAML)
+                } label: {
+                    Label("Edit config.yaml", systemImage: "doc.text")
+                }
+                .controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+
+    private func openGatewaySetupInTerminal() {
+        // Always use the local hermes binary — Terminal launches on this Mac,
+        // not the remote. (Webhook setup is itself local Hermes anyway since
+        // the gateway runs on the machine talking to messaging platforms.)
+        let hermes = ServerContext.local.paths.hermesBinary
+        let script = "tell application \"Terminal\"\n  activate\n  do script \"\(hermes) gateway setup\"\nend tell"
+        let appleScript = NSAppleScript(source: script)
+        var err: NSDictionary?
+        appleScript?.executeAndReturnError(&err)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "arrow.up.right.square")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+            Text("No webhook subscriptions")
+                .foregroundStyle(.secondary)
+            Text("Webhooks let external services trigger agent responses. Each subscription gets its own URL endpoint.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 440)
+            Button("Create Subscription") {
+                resetAddForm()
+                showAddSheet = true
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+    }
+
+    private var list: some View {
+        ScrollView {
+            LazyVStack(spacing: 1) {
+                ForEach(viewModel.webhooks) { webhook in
+                    row(webhook)
+                }
+            }
+            .padding()
+        }
+    }
+
+    private func row(_ webhook: HermesWebhook) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.up.right.square")
+                .foregroundStyle(.blue)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(webhook.name)
+                    .font(.system(.body, design: .monospaced, weight: .medium))
+                if !webhook.description.isEmpty {
+                    Text(webhook.description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 6) {
+                    Text(webhook.routeSuffix)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .foregroundStyle(.tertiary)
+                    if !webhook.deliver.isEmpty {
+                        Text(webhook.deliver)
+                            .font(.caption2.bold())
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.quaternary)
+                            .clipShape(Capsule())
+                    }
+                    ForEach(webhook.events, id: \.self) { event in
+                        Text(event)
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.blue.opacity(0.12))
+                            .clipShape(Capsule())
+                    }
+                }
+            }
+            // Name, description, route, delivery mode and every event chip
+            // read as one announcement instead of a dozen fragments; the
+            // two buttons stay outside it.
+            .accessibilityElement(children: .combine)
+            Spacer()
+            Button("Test") { viewModel.test(webhook) }
+                .controlSize(.small)
+                .accessibilityLabel(Text("Test \(webhook.name)"))
+            Button("Remove", role: .destructive) { pendingRemove = webhook }
+                .controlSize(.small)
+                .accessibilityLabel(Text("Remove \(webhook.name)"))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.quaternary.opacity(0.3))
+    }
+
+    private var addSheet: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("New Webhook Subscription")
+                .font(.headline)
+            formField("Name (URL suffix)", text: $addName, placeholder: "github_push", mono: true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Prompt").font(.caption).foregroundStyle(.secondary)
+                Text("Use {dot.notation} to reference fields in the webhook payload.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                TextEditor(text: $addPrompt)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(minHeight: 90)
+                    .padding(4)
+                    .background(.quaternary.opacity(0.3))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+            formField("Events (comma separated)", text: $addEvents, placeholder: "push, pull_request", mono: true)
+            formField("Description", text: $addDescription, placeholder: "Optional human description")
+            formField("Skills (comma separated)", text: $addSkills, placeholder: "github-auth, pr-review", mono: true)
+            formField("Deliver", text: $addDeliver, placeholder: "log | telegram | discord | slack")
+            formField("Chat ID", text: $addChatID, placeholder: "Required for cross-platform delivery")
+            // SecureField, not TextField: this is an HMAC signing key, and
+            // the sheet is routinely open while someone is screen-sharing a
+            // setup walkthrough. Leaving it empty is the recommended path —
+            // Hermes mints a stronger one and the post-create sheet hands it
+            // back for copying.
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Secret").font(.caption).foregroundStyle(.secondary)
+                SecureField("HMAC secret (auto-generated if empty)", text: $addSecret)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.caption, design: .monospaced))
+                    .accessibilityLabel("Secret")
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    showAddSheet = false
+                    // Don't leave a typed HMAC secret sitting in @State
+                    // after the sheet closes — the form is only reset when
+                    // it is next OPENED, so it otherwise lived in memory
+                    // indefinitely. (F9)
+                    addSecret = ""
+                }
+                Button("Subscribe") {
+                    viewModel.subscribe(
+                        name: addName,
+                        prompt: addPrompt,
+                        events: addEvents,
+                        description: addDescription,
+                        skills: addSkills,
+                        deliver: addDeliver,
+                        chatID: addChatID,
+                        secret: addSecret
+                    )
+                    // Cleared immediately: `subscribe` has already copied it
+                    // into the argv it will run, and the form is otherwise
+                    // only reset on the NEXT open — leaving the secret live
+                    // in @State for the rest of the session. (F9)
+                    addSecret = ""
+                    showAddSheet = false
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(addName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding()
+        .frame(minWidth: 560, minHeight: 560)
+    }
+
+    /// Shown once, right after a successful subscribe, when Hermes minted
+    /// the HMAC secret itself. There is no second chance to read it from
+    /// Scarf: `webhook list` does not print secrets, so a user who closes
+    /// this without copying has to open
+    /// `~/.hermes/webhook_subscriptions.json` on the host.
+    @ViewBuilder
+    private func createdSecretSheet(_ created: WebhooksViewModel.CreatedWebhookSecret) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Webhook /\(created.name) created")
+                .font(.headline)
+            Text("Copy the signing secret now — Scarf can't show it again.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if !created.url.isEmpty {
+                copyRow(label: "URL", value: created.url)
+            }
+            copyRow(label: "Secret", value: created.secret)
+            Text("Sign each request body with HMAC-SHA256 using this secret.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Done") { viewModel.createdSecret = nil }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding()
+        .frame(minWidth: 460)
+    }
+
+    @ViewBuilder
+    private func copyRow(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Text(value)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
+                    .background(.quaternary.opacity(0.3))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(value, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .help("Copy \(label)")
+                .accessibilityLabel("Copy \(label)")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func formField(_ label: String, text: Binding<String>, placeholder: String, mono: Bool = false) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            TextField(placeholder, text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(mono ? .system(.caption, design: .monospaced) : .caption)
+                .accessibilityLabel(label)
+        }
+    }
+
+    private func resetAddForm() {
+        addName = ""; addPrompt = ""; addEvents = ""; addDescription = ""
+        addSkills = ""; addDeliver = "log"; addChatID = ""; addSecret = ""
+    }
+}

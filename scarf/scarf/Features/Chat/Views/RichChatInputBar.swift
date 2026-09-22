@@ -1,0 +1,816 @@
+import SwiftUI
+import ScarfCore
+import ScarfDesign
+import UniformTypeIdentifiers
+import os
+#if canImport(AppKit)
+import AppKit
+#endif
+
+struct RichChatInputBar: View {
+    /// Send the user's text and any attached images. Empty `images`
+    /// preserves the v0.11 wire shape; non-empty images are forwarded
+    /// as ACP image content blocks (Hermes v0.12+; the composer hides
+    /// the attachment UI on older hosts).
+    let onSend: (String, [ChatImageAttachment], ChatViewModel.ChatInputMode) -> Void
+    let isEnabled: Bool
+    var commands: [HermesSlashCommand] = []
+    var showCompressButton: Bool = false
+    /// Whether the agent is currently mid-turn. Used to grey-out
+    /// `/steer` in the slash menu on idle pre-v0.13 hosts (where the
+    /// command silently no-ops). v0.13+ hosts allow `/steer` on idle
+    /// and the row stays interactive regardless of `isAgentWorking`.
+    var isAgentWorking: Bool = false
+    /// Whether the chat has an attached ACP session. Drives the
+    /// session-required grey-out set in the slash menu (P2 of the
+    /// projects-feature fix). Distinct from `isEnabled` — the input
+    /// is enabled the moment hermes is installed, but agent-side
+    /// commands (`/reset`, `/compress`, `/context`, etc.) only do anything
+    /// after `session/new` returns. Source: `richChat.sessionId != nil`.
+    var hasActiveSession: Bool = false
+    /// The session's per-session model override, if any — same source
+    /// as `ChatModelBadge` (`chatViewModel.currentModelPreset`). Nil
+    /// means the global `config.yaml` default is active. Feeds the
+    /// non-vision image heads-up (t-31img / gh#113).
+    var activeModelPreset: ModelPreset? = nil
+    /// Live Voice entry point. `nil` renders no button at all, so a host
+    /// that isn't `VoiceLiveReadiness`-ready (older Hermes, chained mode)
+    /// sees the composer exactly as before (charter C1).
+    var voiceLive: VoiceLiveComposerEntry? = nil
+
+    @Environment(\.hermesCapabilities) private var capabilitiesStore
+    @Environment(\.serverContext) private var serverContext
+
+    @State private var text = ""
+    @State private var showCompressSheet = false
+    @State private var compressFocus = ""
+    @State private var showMenu = false
+    @State private var selectedIndex = 0
+    /// Attachments plus the cap they're held against. Slots are reserved
+    /// synchronously on accept and released when the encode lands, so a
+    /// burst of drops can't overshoot the cap through the async gap
+    /// (`ComposerAttachmentSlots`).
+    @State private var slots = ComposerAttachmentSlots(capacity: RichChatInputBar.maxAttachments)
+    /// User-visible failure (decode failed, format unsupported). Auto-clears.
+    @State private var attachmentError: String?
+    /// Vision capability of the session's effective model, resolved
+    /// lazily the first time an image attachment appears (and again on
+    /// model switches). `.unknown` until then — the heads-up only
+    /// renders on a confident `.no`, so the default is silent.
+    @State private var visionCapability: ModelCatalogService.VisionCapability = .unknown
+    /// Display name paired with `visionCapability` for the heads-up copy
+    /// (preset name, or the resolved model ID for the global default).
+    @State private var visionHintModelName: String = ""
+    @FocusState private var isFocused: Bool
+
+    /// Hard cap matches what Hermes' vision aux model swallows comfortably
+    /// in one prompt. Going higher costs tokens without a quality gain.
+    static let maxAttachments = ComposerAttachmentSlots.defaultCapacity
+
+    private static let logger = Logger(subsystem: "com.scarf", category: "ChatComposer")
+
+    /// `nil` until detection finishes — we hide the attachment UI in
+    /// that brief window (~50ms locally, longer over SSH) so we never
+    /// flash an attachment chip a v0.11 host couldn't honor.
+    private var supportsImagePrompts: Bool {
+        capabilitiesStore?.capabilities.hasACPImagePrompts ?? false
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if showMenu {
+                SlashCommandMenu(
+                    commands: filteredCommands,
+                    agentHasCommands: !commands.isEmpty,
+                    disabledCommandNames: disabledMenuCommandNames,
+                    disabledReason: disabledMenuReason,
+                    selectedIndex: $selectedIndex,
+                    onSelect: insertCommand
+                )
+                .id(menuQuery)
+                .background(.regularMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(.separator, lineWidth: 0.5)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .shadow(color: .black.opacity(0.2), radius: 8, x: 0, y: 2)
+                .padding(.horizontal, 12)
+                .padding(.top, 8)
+            }
+
+            if !slots.attachments.isEmpty || slots.isEncoding || attachmentError != nil {
+                attachmentStrip
+            }
+
+            // Heads-up when the active model can't see images natively
+            // (t-31img / gh#113). Advisory only — sending stays enabled
+            // because Hermes may still describe the image via its
+            // auxiliary vision fallback.
+            if RichChatViewModel.shouldShowNonVisionImageHint(
+                attachmentCount: slots.attachments.count,
+                capability: visionCapability
+            ) {
+                nonVisionHintRow
+            }
+
+            HStack(alignment: .bottom, spacing: ScarfSpace.s2) {
+                if showCompressButton {
+                    Button {
+                        compressFocus = ""
+                        showCompressSheet = true
+                    } label: {
+                        Image(systemName: "rectangle.compress.vertical")
+                            .font(.system(size: 16))
+                            .foregroundStyle(ScarfColor.foregroundMuted)
+                            .padding(6)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!isEnabled)
+                    .help("Compress conversation (\(RichChatViewModel.compressSlashCommand(capabilities: capabilitiesStore?.capabilities ?? .empty)))")
+                    .accessibilityLabel(Text("Compress Conversation"))
+                }
+
+                if supportsImagePrompts {
+                    attachmentButton
+                }
+
+                TextEditor(text: $text)
+                    // UI-gate handle for the Live chat journey
+                    // (ChatJourneyUITests). Applied HERE, directly on
+                    // the TextEditor and before the background/overlay
+                    // modifiers, so the identifier lands on the text
+                    // element itself — XCUITest reads the typed value
+                    // back off it, and an identifier further down the
+                    // chain would name the composed group instead.
+                    .accessibilityIdentifier("chat.composer.input")
+                    // The composer's only visible name is the placeholder
+                    // overlay, which is `.allowsHitTesting(false)` and
+                    // disappears the moment the field has content — so
+                    // VoiceOver lands on an unnamed text area and Voice
+                    // Control has nothing sayable to target it by. A
+                    // literal here (not a String variable) so it extracts
+                    // into the catalogue.
+                    .accessibilityLabel(Text("Message Hermes"))
+                    .font(ScarfFont.body)
+                    .scrollContentBackground(.hidden)
+                    .focused($isFocused)
+                    .frame(minHeight: 28, maxHeight: 120)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: ScarfRadius.xl, style: .continuous)
+                            .fill(ScarfColor.backgroundSecondary)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: ScarfRadius.xl, style: .continuous)
+                                    .strokeBorder(showMenu ? ScarfColor.accent : ScarfColor.borderStrong, lineWidth: 1)
+                            )
+                    )
+                    .overlay(alignment: .topLeading) {
+                        // Placeholder ghosting (#65): TextEditor's
+                        // NSTextView updates the visible glyphs a frame
+                        // before the SwiftUI binding propagates, so a
+                        // bare `if text.isEmpty` overlay renders the
+                        // translucent placeholder text on top of the
+                        // just-typed character — visible as a "behind
+                        // or around" ghost. Three mitigations:
+                        //
+                        //   1. Pin an opaque rectangle behind the
+                        //      placeholder text. During any single-
+                        //      frame lag the user sees a clean
+                        //      placeholder, never layered glyphs.
+                        //   2. Use `.opacity(...)` instead of an `if`.
+                        //      Keeps the view tree stable per
+                        //      keystroke (removes the per-keystroke
+                        //      view-mutation churn the composer was
+                        //      already paying for).
+                        //   3. Constrain to a single line with
+                        //      `frame(maxWidth: .infinity)` and
+                        //      `truncationMode(.tail)` so the long-form
+                        //      hint can't escape the rounded
+                        //      TextEditor bounds when the sidebar /
+                        //      detail-pane geometry compresses the
+                        //      composer (was visibly overflowing).
+                        Text(supportsImagePrompts
+                             ? "Message Hermes…  /  for commands · drag images to attach"
+                             : "Message Hermes…  /  for commands")
+                            .scarfStyle(.body)
+                            .foregroundStyle(ScarfColor.foregroundFaint)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(ScarfColor.backgroundSecondary)
+                            // Hide once the field has any content OR
+                            // the user is actively focused — matches
+                            // standard NSTextField / UITextField
+                            // placeholder semantics.
+                            .opacity((text.isEmpty && !isFocused) ? 1 : 0)
+                            .allowsHitTesting(false)
+                    }
+                    // Drag-drop image attachments. Receives both file URLs
+                    // (from Finder) and raw image bitmap data (from
+                    // screenshot tools that drop tiff/png directly).
+                    // Capability-gated so v0.11 hosts don't surface a
+                    // drop target that does nothing.
+                    .onDrop(
+                        of: supportsImagePrompts ? [.image, .fileURL] : [],
+                        isTargeted: nil
+                    ) { providers in
+                        guard supportsImagePrompts else { return false }
+                        ingestProviders(providers)
+                        return true
+                    }
+                    // Paste from screenshots / browser context menu.
+                    // Accepting `Data` keeps us off `NSImage` which would
+                    // require AppKit-typed paste. v0.12+ only.
+                    .onPasteCommand(of: pasteAcceptedTypes) { providers in
+                        ingestProviders(providers)
+                    }
+                    .onKeyPress(.upArrow, phases: .down) { _ in
+                        guard showMenu, !filteredCommands.isEmpty else { return .ignored }
+                        let n = filteredCommands.count
+                        selectedIndex = (selectedIndex - 1 + n) % n
+                        return .handled
+                    }
+                    .onKeyPress(.downArrow, phases: .down) { _ in
+                        guard showMenu, !filteredCommands.isEmpty else { return .ignored }
+                        let n = filteredCommands.count
+                        selectedIndex = (selectedIndex + 1) % n
+                        return .handled
+                    }
+                    .onKeyPress(.tab, phases: .down) { _ in
+                        guard showMenu,
+                              let command = filteredCommands[safe: selectedIndex] else { return .ignored }
+                        insertCommand(command)
+                        return .handled
+                    }
+                    .onKeyPress(.escape, phases: .down) { _ in
+                        guard showMenu else { return .ignored }
+                        showMenu = false
+                        return .handled
+                    }
+                    .onKeyPress(.return, phases: .down) { press in
+                        guard Self.shouldSendOnReturn(
+                            hasMarkedText: Self.composerHasMarkedText(),
+                            modifiers: press.modifiers
+                        ) else { return .ignored }
+                        if showMenu, let command = filteredCommands[safe: selectedIndex] {
+                            insertCommand(command)
+                            return .handled
+                        }
+                        send()
+                        return .handled
+                    }
+
+                if let voiceLive {
+                    VoiceLiveComposerButton(entry: voiceLive)
+                }
+
+                Button {
+                    send()
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(canSend ? ScarfColor.onAccent : ScarfColor.foregroundFaint)
+                        .frame(width: 30, height: 30)
+                        .background(
+                            RoundedRectangle(cornerRadius: ScarfRadius.lg, style: .continuous)
+                                .fill(canSend ? ScarfColor.accent : ScarfColor.backgroundSecondary)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSend)
+                .help("Send message (Enter)")
+                // UI-gate handle for the Live chat journey. The label is
+                // an SF Symbol with no text, so there is nothing else to
+                // address this button by.
+                .accessibilityIdentifier("chat.composer.send")
+                .accessibilityLabel(Text("Send message"))
+            }
+            .padding(.horizontal, ScarfSpace.s3)
+            .padding(.vertical, ScarfSpace.s2)
+        }
+        .background(ScarfColor.backgroundSecondary)
+        .overlay(
+            Rectangle().fill(ScarfColor.border).frame(height: 1),
+            alignment: .top
+        )
+        .onChange(of: text) { _, _ in
+            updateMenuState()
+        }
+        // Watch `commands.count` rather than `commands.map(\.id)` — the
+        // mapped form allocates a fresh `[String]` on every body
+        // re-eval (i.e. every keystroke), which is wasted work even
+        // when the array compares equal. The count proxy fires when
+        // the agent advertises new commands.
+        .onChange(of: commands.count) { _, _ in
+            updateMenuState()
+        }
+        // Vision-capability lookup, keyed so it fires only when an
+        // attachment first appears or the effective model changes —
+        // never per keystroke. The catalog parse itself is additionally
+        // memoized per (provider, model) inside ModelCatalogService.
+        .task(id: visionLookupKey) {
+            await refreshVisionCapability()
+        }
+        .sheet(isPresented: $showCompressSheet) {
+            compressSheet
+        }
+    }
+
+    /// Identity for the capability lookup: flips when attachments go
+    /// empty↔non-empty or the session's effective model changes.
+    /// Attachment count beyond "any" is irrelevant — capability is
+    /// per-model. Keyed on the preset's (provider, model) CONTENT, not
+    /// its UUID: editing a preset in place (same id, new model) must
+    /// re-probe, and a rename alone must not.
+    private var visionLookupKey: String {
+        let modelKey = activeModelPreset.map { "\($0.providerID)|\($0.modelID)" } ?? "global-default"
+        return "\(slots.attachments.isEmpty ? "0" : "1")|\(modelKey)"
+    }
+
+    /// Resolve the effective model (preset override, else config.yaml
+    /// global default — the `ChatModelBadge` resolution) and ask the
+    /// models.dev catalog whether it can see images. Config read +
+    /// catalog parse run off-main; only fires while attachments exist.
+    private func refreshVisionCapability() async {
+        // Hide the hint while (re)resolving — a preset switch must never
+        // leave the previous model's warning on screen.
+        visionCapability = .unknown
+        guard !slots.attachments.isEmpty else { return }
+        let preset = activeModelPreset
+        let context = serverContext
+        let (capability, name) = await Task.detached(
+            priority: .utility
+        ) { () -> (ModelCatalogService.VisionCapability, String) in
+            // Config is read on BOTH paths (preset or global default):
+            // Hermes checks the routing overrides — `agent.
+            // image_input_mode: native`, `model.supports_vision` —
+            // BEFORE any models.dev lookup, so a catalog `.no` under
+            // either override would be a false warning. Suppress by
+            // resolving `.unknown` (t-31img audit).
+            let yaml = HermesConfigReader.readRawConfig(context: context)
+            if let yaml,
+               RichChatViewModel.nonVisionHintSuppressedByConfig(configYAML: yaml) {
+                return (.unknown, "")
+            }
+            let configProvider: String
+            let configModel: String
+            if preset == nil, let yaml {
+                let config = HermesConfig(yaml: yaml)
+                configProvider = config.provider
+                configModel = config.model
+            } else {
+                configProvider = ""
+                configModel = ""
+            }
+            guard let active = RichChatViewModel.resolveActiveModel(
+                preset: preset,
+                configProvider: configProvider,
+                configModel: configModel
+            ) else { return (.unknown, "") }
+            let displayName = preset?.name ?? active.modelID
+            let capability = ModelCatalogService(context: context)
+                .visionCapability(providerID: active.providerID, modelID: active.modelID)
+            // Local Ollama models never appear in models.dev, so the
+            // catalog lookup is always `.unknown` and the heads-up stays
+            // silent for exactly the audience most likely to attach an
+            // image to a text-only model. Ollama's /api/show reports a
+            // per-model `capabilities` array — probe the ONE active model
+            // (cached) to recover a confident verdict. `.no` warns; a
+            // pre-0.29 daemon that omits capabilities stays `.unknown`
+            // (no false warning). Cloud providers keep the catalog verdict.
+            if capability == .unknown,
+               let descriptor = LocalModelProvider.descriptor(for: active.providerID),
+               descriptor.enumerationHint == .ollamaTags {
+                let baseURL = yaml.map { HermesConfig(yaml: $0).modelBaseURL } ?? ""
+                let local = LocalModelEnumerator.ollamaVisionCapability(
+                    modelID: active.modelID,
+                    baseURL: baseURL.isEmpty ? nil : baseURL,
+                    descriptorDefault: descriptor.defaultBaseURL,
+                    transport: context.makeTransport()
+                )
+                return (local, displayName)
+            }
+            return (capability, displayName)
+        }.value
+        // `.task(id:)` cancelled us because the key changed — a newer
+        // lookup owns the state now; don't clobber it with stale results.
+        guard !Task.isCancelled else { return }
+        visionCapability = capability
+        visionHintModelName = name
+    }
+
+    /// Compact advisory row under the attachment strip — matches the
+    /// strip's caption idiom; `.warning` (advisory), never `.danger`
+    /// (nothing is blocked).
+    private var nonVisionHintRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: ScarfSpace.s1) {
+            Image(systemName: "eye.slash")
+                .font(.system(size: 10))
+            Text(RichChatViewModel.nonVisionImageHint(
+                modelDisplayName: visionHintModelName.isEmpty ? "This model" : visionHintModelName
+            ))
+            .scarfStyle(.caption)
+            .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(ScarfColor.warning)
+        .padding(.horizontal, ScarfSpace.s3)
+        .padding(.top, ScarfSpace.s1)
+    }
+
+    /// Horizontal preview strip for attached images. Each chip shows the
+    /// thumbnail (or a placeholder icon if we couldn't render one) plus
+    /// an X to remove the attachment.
+    @ViewBuilder
+    private var attachmentStrip: some View {
+        HStack(alignment: .center, spacing: ScarfSpace.s2) {
+            if slots.isEncoding {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Encoding…")
+                    .scarfStyle(.caption)
+                    .foregroundStyle(ScarfColor.foregroundMuted)
+            }
+            ForEach(slots.attachments) { attachment in
+                attachmentChip(attachment)
+            }
+            if let err = attachmentError {
+                Text(err)
+                    .scarfStyle(.caption)
+                    .foregroundStyle(ScarfColor.danger)
+            }
+            Spacer(minLength: 0)
+            if !slots.attachments.isEmpty {
+                Text("\(slots.attachments.count)/\(Self.maxAttachments)")
+                    .scarfStyle(.caption)
+                    .foregroundStyle(ScarfColor.foregroundFaint)
+            }
+        }
+        .padding(.horizontal, ScarfSpace.s3)
+        .padding(.top, ScarfSpace.s2)
+    }
+
+    @ViewBuilder
+    private func attachmentChip(_ attachment: ChatImageAttachment) -> some View {
+        let thumb = chipThumbnail(for: attachment)
+        HStack(spacing: 4) {
+            thumb
+                .frame(width: 32, height: 32)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+            Button {
+                slots.remove(id: attachment.id)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(ScarfColor.foregroundMuted)
+            }
+            .buttonStyle(.plain)
+            .help(attachment.filename ?? "Image attachment")
+            .accessibilityLabel(Text("Remove attached image"))
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: ScarfRadius.md)
+                .fill(ScarfColor.backgroundTertiary)
+        )
+    }
+
+    /// Render the inline thumbnail for a chip. Falls back to a generic
+    /// photo icon when the encoder didn't produce a thumbnail (e.g. the
+    /// image was already small enough to skip the resize step).
+    @ViewBuilder
+    private func chipThumbnail(for attachment: ChatImageAttachment) -> some View {
+        if let thumb = attachment.thumbnailBase64,
+           let data = Data(base64Encoded: thumb),
+           let image = NSImage(data: data) {
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+        } else {
+            Image(systemName: "photo")
+                .foregroundStyle(ScarfColor.foregroundMuted)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(ScarfColor.backgroundSecondary)
+        }
+    }
+
+    private var attachmentButton: some View {
+        Button {
+            presentImagePicker()
+        } label: {
+            Image(systemName: "paperclip")
+                .font(.system(size: 16))
+                .foregroundStyle(ScarfColor.foregroundMuted)
+                .padding(6)
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled || slots.isFull)
+        .help("Attach image (\(slots.attachments.count)/\(Self.maxAttachments))")
+        .accessibilityLabel(Text("Attach image"))
+    }
+
+    private var compressSheet: some View {
+        VStack(alignment: .leading, spacing: ScarfSpace.s3) {
+            Text("Compress Conversation")
+                .scarfStyle(.headline)
+                .foregroundStyle(ScarfColor.foregroundPrimary)
+            Text("Optionally focus the summary on a specific topic. Leave blank to compress evenly.")
+                .scarfStyle(.caption)
+                .foregroundStyle(ScarfColor.foregroundMuted)
+            ScarfTextField("Focus topic (optional)", text: $compressFocus)
+            HStack {
+                Spacer()
+                Button("Cancel") { showCompressSheet = false }
+                    .buttonStyle(ScarfGhostButton())
+                Button("Compress") {
+                    // Spelling is version-dependent on the ACP adapter —
+                    // `/compact` below v0.19.1, `/compress` at/above, no
+                    // alias either way. See `hasACPCompressSpelling`.
+                    let command = RichChatViewModel.compressSlashCommand(
+                        capabilities: capabilitiesStore?.capabilities ?? .empty,
+                        focus: compressFocus
+                    )
+                    onSend(command, [], .quickCommand)
+                    showCompressSheet = false
+                }
+                .buttonStyle(ScarfPrimaryButton())
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(ScarfSpace.s5)
+        .frame(width: 380)
+    }
+
+    private var canSend: Bool {
+        guard isEnabled else { return false }
+        // Allow sending image-only messages once at least one attachment
+        // exists — vision models accept "describe this" with no text.
+        if !slots.attachments.isEmpty { return true }
+        return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// MIME types accepted for paste. Restricting to image-bearing
+    /// providers stops macOS from offering a paste menu when the user
+    /// has plain text on the clipboard.
+    private var pasteAcceptedTypes: [UTType] {
+        supportsImagePrompts ? [.image, .png, .jpeg, .tiff, .heic] : []
+    }
+
+    private var shouldShowMenu: Bool {
+        RichChatViewModel.shouldShowSlashMenu(text: text)
+    }
+
+    private var menuQuery: String {
+        RichChatViewModel.slashMenuQuery(text: text)
+    }
+
+    private var filteredCommands: [HermesSlashCommand] {
+        RichChatViewModel.filterSlashCommands(commands, query: menuQuery)
+    }
+
+    private var disabledMenuCommandNames: Set<String> {
+        RichChatViewModel.disabledSlashCommandNames(
+            isAgentWorking: isAgentWorking,
+            hasActiveSession: hasActiveSession,
+            capabilities: capabilitiesStore?.capabilities ?? .empty
+        )
+    }
+
+    private var disabledMenuReason: String? {
+        RichChatViewModel.disabledSlashCommandReason(
+            isAgentWorking: isAgentWorking,
+            hasActiveSession: hasActiveSession,
+            capabilities: capabilitiesStore?.capabilities ?? .empty
+        )
+    }
+
+    /// Should a Return keypress send (or accept a slash command), or be
+    /// handed back to the text system?
+    ///
+    /// Two cases hand it back. Shift-Return is the user asking for a
+    /// newline (unchanged). And Return while the input method has MARKED
+    /// TEXT — the underlined, not-yet-committed run a Japanese, Chinese or
+    /// Korean IME shows while the user picks among candidates — is the
+    /// user COMMITTING that candidate, not sending a message. Swallowing
+    /// it sent a half-composed sentence and left the IME's state stranded;
+    /// letting it through is what every other macOS composer does.
+    ///
+    /// Pure so the rule is testable without an NSTextView or a live IME.
+    static func shouldSendOnReturn(hasMarkedText: Bool, modifiers: EventModifiers) -> Bool {
+        if hasMarkedText { return false }
+        if modifiers.contains(.shift) { return false }
+        return true
+    }
+
+    /// Whether the focused text view is mid-IME-composition. SwiftUI's
+    /// `onKeyPress` hands us no view, so we ask the key window's first
+    /// responder — which, for a focused `TextEditor`, is its backing
+    /// `NSTextView`. Anything else (no key window, a non-text responder)
+    /// answers `false`, i.e. "behave exactly as before".
+    static func composerHasMarkedText() -> Bool {
+        #if canImport(AppKit)
+        guard let textView = NSApp.keyWindow?.firstResponder as? NSTextView else { return false }
+        return textView.hasMarkedText()
+        #else
+        return false
+        #endif
+    }
+
+    private func updateMenuState() {
+        let shouldShow = shouldShowMenu
+
+        // Common case: user is composing normal text and the menu is
+        // already hidden. Skip the filter computation + state writes
+        // entirely so onChange stays cheap. Without this guard typing
+        // recomputes `filteredCommands` on every keystroke even when
+        // the menu can't possibly appear.
+        guard shouldShow || showMenu else { return }
+
+        // Compute desired selection, then only write what changed.
+        // SwiftUI emits "onChange action tried to update multiple
+        // times per frame" when an onChange handler mutates more than
+        // one piece of state per frame; the warning correlates with
+        // unusable typing lag because each redundant write triggers
+        // another body re-eval.
+        let count = filteredCommands.count
+        let newSelection: Int
+        if count == 0 {
+            newSelection = 0
+        } else if selectedIndex >= count {
+            newSelection = count - 1
+        } else if selectedIndex < 0 {
+            newSelection = 0
+        } else {
+            newSelection = selectedIndex
+        }
+
+        if shouldShow != showMenu {
+            showMenu = shouldShow
+        }
+        if newSelection != selectedIndex {
+            selectedIndex = newSelection
+        }
+    }
+
+    private func insertCommand(_ command: HermesSlashCommand) {
+        if command.argumentHint != nil {
+            text = "/\(command.name) "
+        } else {
+            text = "/\(command.name)"
+        }
+        showMenu = false
+        selectedIndex = 0
+        isFocused = true
+    }
+
+    private func send() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard canSend else { return }
+        onSend(trimmed, slots.drain(), .typed)
+        text = ""
+        showMenu = false
+        selectedIndex = 0
+    }
+
+    // MARK: - Attachment ingestion
+
+    /// Pull image bytes out of a set of `NSItemProvider`s (drag/drop or
+    /// paste). Each provider may carry a file URL OR raw image data —
+    /// we try both. Caps at `maxAttachments`; surplus drops are
+    /// dropped silently with a status message.
+    private func ingestProviders(_ providers: [NSItemProvider]) {
+        // Reserve SYNCHRONOUSLY, before any of the asynchronous
+        // provider-load / encode work starts. Checking `attachments.count`
+        // here and appending after the encode let two quick drops both
+        // pass the same pre-encode check and overshoot the cap.
+        let granted = slots.reserve(upTo: providers.count)
+        guard granted > 0 else {
+            attachmentError = "Limit of \(Self.maxAttachments) images reached"
+            scheduleAttachmentErrorClear()
+            return
+        }
+        for provider in providers.prefix(granted) {
+            ingestProvider(provider)
+        }
+    }
+
+    /// Consumes exactly ONE reservation taken by `ingestProviders`: either
+    /// it reaches `encode` (which commits or releases it) or it releases
+    /// the slot itself on the way out.
+    private func ingestProvider(_ provider: NSItemProvider) {
+        // Prefer file URL when available — gives us the original filename
+        // for the attachment chip's tooltip.
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            // Fire-and-forget drag-load; the returned NSProgress is unused.
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, let data = try? Data(contentsOf: url) else {
+                    Task { @MainActor in
+                        slots.release()
+                        attachmentError = "Couldn't read dropped file"
+                        scheduleAttachmentErrorClear()
+                    }
+                    return
+                }
+                Task { @MainActor in
+                    encode(data: data, filename: url.lastPathComponent)
+                }
+            }
+            return
+        }
+        for typeId in [UTType.image.identifier, UTType.png.identifier, UTType.jpeg.identifier, UTType.tiff.identifier, UTType.heic.identifier] {
+            if provider.hasItemConformingToTypeIdentifier(typeId) {
+                provider.loadDataRepresentation(forTypeIdentifier: typeId) { data, _ in
+                    guard let data else {
+                        Task { @MainActor in
+                            slots.release()
+                            attachmentError = "Couldn't decode pasted image"
+                            scheduleAttachmentErrorClear()
+                        }
+                        return
+                    }
+                    Task { @MainActor in
+                        encode(data: data, filename: nil)
+                    }
+                }
+                return
+            }
+        }
+        // Nothing in this provider we can read — hand its slot back.
+        slots.release()
+    }
+
+    private func encode(data: Data, filename: String?) {
+        // `Task {}` inherits this View's @MainActor isolation, so the
+        // @State mutations stay on main; only the CPU-bound image encode
+        // hops off via an inner `Task.detached` that captures just the
+        // Sendable `data` / `filename`. This View is a struct, so the
+        // audit's `[weak self]` suggestion doesn't apply — the fix is to
+        // stop capturing self across the isolation boundary at all. (t-aud02)
+        Task {
+            do {
+                let attachment = try await Task.detached(priority: .userInitiated) {
+                    try ImageEncoder().encode(rawBytes: data, sourceFilename: filename)
+                }.value
+                slots.commit(attachment)
+            } catch {
+                slots.release()
+                attachmentError = (error as? LocalizedError)?.errorDescription ?? "Couldn't encode image"
+                Self.logger.warning("ImageEncoder failed: \(error.localizedDescription, privacy: .public)")
+                scheduleAttachmentErrorClear()
+            }
+        }
+    }
+
+    private func scheduleAttachmentErrorClear() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            attachmentError = nil
+        }
+    }
+
+    private func presentImagePicker() {
+        #if canImport(AppKit)
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.image, .png, .jpeg, .tiff, .heic]
+        panel.message = String(localized: "Choose images to attach")
+        panel.prompt = String(localized: "Attach")
+        let response = panel.runModal()
+        guard response == .OK else { return }
+        // Same synchronous reservation as the drop/paste path.
+        let granted = slots.reserve(upTo: panel.urls.count)
+        let urls = Array(panel.urls.prefix(granted))
+        guard !urls.isEmpty else { return }
+        // Read each picked file off-main (disk I/O), then hand to `encode`
+        // on main (it dispatches the CPU-bound encode itself). `Task {}`
+        // inherits @MainActor; the inner detached read captures only the
+        // Sendable `url`. (t-aud02)
+        Task {
+            for url in urls {
+                let data = await Task.detached(priority: .userInitiated) {
+                    try? Data(contentsOf: url)
+                }.value
+                guard let data else {
+                    slots.release()
+                    continue
+                }
+                encode(data: data, filename: url.lastPathComponent)
+            }
+        }
+        #endif
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
+}

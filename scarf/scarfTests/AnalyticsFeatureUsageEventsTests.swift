@@ -1,0 +1,388 @@
+import Foundation
+import Testing
+import Stats
+import StatsTesting
+import ScarfCore
+@testable import scarf
+
+/// Phase 5 (feature usage & lifecycle) instrumentation.
+///
+/// The `section_viewed` tests now install a ``CapturingUsageTracker`` through
+/// `Analytics.install(_:)` and assert on the events the app actually emitted —
+/// possible only since `Analytics` grew an injectable ``UsageTracking`` seam
+/// (before that, `Analytics.record` funnelled into a `StatsClient` that is
+/// `nil` under XCTest, so a test could observe the dedupe key set but never
+/// the emission). The remaining tests still assert on pure decision logic,
+/// which is the right level for them.
+///
+/// Nested inside Phase 3's suite for the same reason Phase 4's is: real
+/// `StatsClient`s share one app-id-keyed `UserDefaults` enabled flag, and
+/// `.serialized` only covers a suite and its subgroups, not siblings. The
+/// tracker seam is process-wide too, so `.serialized` is load-bearing twice
+/// over.
+extension AnalyticsConnectionEventsTests {
+
+@Suite("Analytics feature usage events", .serialized)
+struct AnalyticsFeatureUsageEventsTests {
+
+    /// The `section` tokens of every `section_viewed` event emitted so far,
+    /// in order.
+    private static func sections(_ tracker: CapturingUsageTracker) -> [String] {
+        tracker.captured.filter { $0.name == "section_viewed" }.compactMap { $0.props["section"] }
+    }
+
+    @Test("recordOnce reports the first call for a key and nothing after")
+    func recordOnceIsOncePerKey() {
+        let tracker = CapturingUsageTracker()
+        Analytics.install(tracker)
+        defer { Analytics.install(nil) }
+
+        #expect(Analytics.recordOnce(.sectionViewed(section: .chat), key: "k") == true)
+        #expect(Analytics.recordOnce(.sectionViewed(section: .chat), key: "k") == false)
+        #expect(Analytics.recordOnce(.sectionViewed(section: .logs), key: "k2") == true)
+        // The suppressed call really was suppressed at the sink, not just in
+        // the return value.
+        #expect(Self.sections(tracker) == ["chat", "logs"])
+    }
+
+    /// A fresh tracker is a clean dedupe slate — the property that replaced
+    /// `Analytics.resetRecordedOnceForTesting()`.
+    @Test("a fresh tracker starts with clean recordOnce state")
+    func freshTrackerHasCleanDedupeState() {
+        let first = CapturingUsageTracker()
+        Analytics.install(first)
+        #expect(Analytics.recordOnce(.sectionViewed(section: .chat), key: "k") == true)
+        #expect(Analytics.recordOnce(.sectionViewed(section: .chat), key: "k") == false)
+
+        let second = CapturingUsageTracker()
+        Analytics.install(second)
+        defer { Analytics.install(nil) }
+        #expect(Analytics.recordOnce(.sectionViewed(section: .chat), key: "k") == true)
+        #expect(Self.sections(second) == ["chat"])
+    }
+
+    /// `NoopUsageTracker` swallows the event but keeps the dedupe answer
+    /// honest, so callers that branch on the return value behave identically.
+    @Test("the noop tracker records nothing but still dedupes")
+    func noopTrackerDedupesWithoutRecording() {
+        let noop = NoopUsageTracker()
+        Analytics.install(noop)
+        defer { Analytics.install(nil) }
+
+        #expect(Analytics.recordOnce(.sectionViewed(section: .chat), key: "k") == true)
+        #expect(Analytics.recordOnce(.sectionViewed(section: .chat), key: "k") == false)
+        Analytics.record(.voiceUsed(kind: .tts))
+    }
+
+    // MARK: - section tokens
+
+    @Test("section tokens are stable snake_case, not display copy")
+    func sectionTokensAreStableSnakeCase() {
+        // The point of the mapping: renaming the sidebar item must not
+        // rename the metric.
+        #expect(SidebarSection.quickCommands.analyticsToken == "quick_commands")
+        #expect(SidebarSection.mcpServers.analyticsToken == "mcp_servers")
+        #expect(SidebarSection.credentialPools.analyticsToken == "credential_pools")
+        // `.proxy` displays as "Hermes Proxy" and `.gateway` as "Messaging
+        // Gateway" — the token follows neither.
+        #expect(SidebarSection.proxy.analyticsToken == "proxy")
+        #expect(SidebarSection.gateway.analyticsToken == "gateway")
+
+        var seen: Set<String> = []
+        for section in SidebarSection.allCases {
+            let token = section.analyticsToken
+            #expect(token.range(of: "^[a-z][a-z0-9_]*$", options: .regularExpression) != nil)
+            #expect(seen.insert(token).inserted)
+        }
+    }
+
+    // MARK: - setting_changed key sanitization
+
+    @Test("setting keys pass through as bounded dotted identifiers")
+    func settingKeysPassThroughVerbatim() {
+        // Every real call site in SettingsViewModel already passes a
+        // short, bounded-cardinality dotted path (literal strings, or —
+        // for `setAuxiliary` — segments drawn from AuxiliaryTab's fixed
+        // task/field pickers, never a text field). The sanitizer's job for
+        // these is a no-op.
+        #expect(SettingsViewModel.analyticsSettingKey("display.streaming") == "display.streaming")
+        #expect(SettingsViewModel.analyticsSettingKey("model.default") == "model.default")
+        #expect(SettingsViewModel.analyticsSettingKey("auxiliary.summarization.provider") == "auxiliary.summarization.provider")
+    }
+
+    @Test("setting keys never carry a value, and a hypothetical free-typed segment is neutered")
+    func settingKeysAreNeverValuesAndCollapseFreeText() {
+        // `analyticsSettingKey` takes only the key — there is no parameter
+        // through which a value could ride along, so "never the value" is
+        // enforced by the function's signature, not just its behavior.
+        // This test instead covers the defense-in-depth half: a
+        // hypothetical future dynamic segment (a hostname-, path-, or
+        // secret-shaped fragment) is neither reproduced verbatim nor
+        // allowed to extend the key past three segments.
+        let noisy = "auxiliary./Users/someone/secret.txt.hunter2 password!.extra.segment"
+        let key = SettingsViewModel.analyticsSettingKey(noisy)
+        for fragment in ["/Users", "someone", "secret.txt", "hunter2", "password", "!"] {
+            #expect(!key.contains(fragment))
+        }
+        // At most 3 dot-segments survive, regardless of how many the input had.
+        #expect(key.split(separator: ".", omittingEmptySubsequences: false).count <= 3)
+    }
+
+    // MARK: - first_run / warm
+
+    @Test("first launch ever reports not warm, and marks itself launched")
+    func firstLaunchIsNotWarm() {
+        let suiteName = "scarf-analytics-featureusage-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let warm = Analytics.FirstRunMarker.consumeAndMarkLaunched(defaults: defaults)
+        #expect(warm == false)
+    }
+
+    @Test("a subsequent launch reports warm, not a repeat first_run")
+    func subsequentLaunchIsWarm() {
+        let suiteName = "scarf-analytics-featureusage-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let firstWarm = Analytics.FirstRunMarker.consumeAndMarkLaunched(defaults: defaults)
+        #expect(firstWarm == false)
+
+        let secondWarm = Analytics.FirstRunMarker.consumeAndMarkLaunched(defaults: defaults)
+        #expect(secondWarm == true)
+    }
+
+    // MARK: - Buckets
+
+    /// `skills_bootstrapped` replaced a per-skill `skill_installed
+    /// {source:"bundled"}` that fired from the unattended launch bootstrap
+    /// and drowned the user-driven installs on that same event name.
+    @Test("skills_bootstrapped count_bucket covers the taxonomy's three buckets")
+    func bootstrapCountBuckets() {
+        #expect(SkillBootstrapService.bootstrapCountBucket(1) == "1")
+        #expect(SkillBootstrapService.bootstrapCountBucket(2) == "2_5")
+        #expect(SkillBootstrapService.bootstrapCountBucket(5) == "2_5")
+        #expect(SkillBootstrapService.bootstrapCountBucket(6) == "gt_5")
+        #expect(SkillBootstrapService.bootstrapCountBucket(999) == "gt_5")
+        // Never called with these, but no input may produce a fourth token.
+        #expect(SkillBootstrapService.bootstrapCountBucket(0) == "1")
+        #expect(SkillBootstrapService.bootstrapCountBucket(-3) == "1")
+    }
+
+    /// The nothing-written case — the steady state on every launch after
+    /// the first. A silent run is the whole point of the change, so the
+    /// decision is a pure function the test can read directly (
+    /// `Analytics.record` is a no-op under XCTest, so a sink can't be).
+    @Test("a bootstrap run that wrote nothing emits no event")
+    func bootstrapWithNothingWrittenIsSilent() {
+        func props(_ written: Int) -> [String: String]? {
+            SkillBootstrapService.bootstrapEvent(written: written)?.props.mapValues(\.usageEventToken)
+        }
+        #expect(SkillBootstrapService.bootstrapEvent(written: 0) == nil)
+        #expect(props(1) == ["count_bucket": "1"])
+        #expect(props(4) == ["count_bucket": "2_5"])
+        #expect(props(9) == ["count_bucket": "gt_5"])
+        #expect(SkillBootstrapService.bootstrapEvent(written: 1)?.name == "skills_bootstrapped")
+    }
+
+    // MARK: - template_installed / skill_installed source attribution
+
+    /// Locate a shipped `.scarftemplate` to drive the installer VM with.
+    nonisolated private static func locateExample(author: String, name: String) throws -> String {
+        var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        for _ in 0..<6 {
+            let candidate = dir.appendingPathComponent("templates/\(author)/\(name)/\(name).scarftemplate")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate.path
+            }
+            dir = dir.deletingLastPathComponent()
+        }
+        throw ProjectTemplateError.requiredFileMissing("templates/\(author)/\(name)/\(name).scarftemplate")
+    }
+
+    @MainActor
+    private static func awaitPendingSource(_ vm: TemplateInstallerViewModel) async -> String? {
+        for _ in 0..<200 {
+            if let source = vm.pendingInstallSourceForTesting { return source }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return nil
+    }
+
+    /// The regression: `installSource` used to be one shared VM property
+    /// written at entry and read back at `confirmInstall()`, so a second
+    /// entry point landing while the first install was still in flight
+    /// re-attributed the first install to the second's source. The token
+    /// now rides the pending-install state, published in the same step as
+    /// the inspection it describes.
+    @Test("each install keeps its own source when a second entry interleaves")
+    @MainActor
+    func perInstallSourceSurvivesInterleavedEntry() async throws {
+        let bundle = try Self.locateExample(author: "awizemann", name: "hackernews-digest")
+        let vm = TemplateInstallerViewModel(context: .local)
+        defer { vm.cancel() }
+
+        // Entry A: a catalog pick.
+        vm.openLocalFile(bundle, source: .hub)
+        #expect(await Self.awaitPendingSource(vm) == "hub")
+
+        // Entry B lands while A is still awaiting confirmation: A's pending
+        // state (source included) is dropped wholesale rather than leaving
+        // a stale token behind for B — or B's token in front of A's bundle.
+        vm.openLocalFile(bundle, source: .url)
+        #expect(vm.pendingInstallSourceForTesting == nil)
+        #expect(await Self.awaitPendingSource(vm) == "url")
+    }
+
+    /// `skill_installed` used to fire once per *declared* skill in
+    /// `manifest.contents.skills`. It now counts the skill directories the
+    /// installer actually writes, derived from the plan's file copies.
+    @Test("skill_installed counts written skill dirs, not declared names")
+    func installedSkillCountFollowsWrittenFiles() throws {
+        func plan(namespaceDir: String?, files: [String], declared: [String]?) -> TemplateInstallPlan {
+            TemplateInstallPlan(
+                manifest: ProjectTemplateServiceTests.sampleManifest(skills: declared),
+                unpackedDir: "/tmp/unpacked",
+                projectDir: "/tmp/project",
+                projectFiles: [],
+                skillsNamespaceDir: namespaceDir,
+                skillsFiles: files.map {
+                    TemplateFileCopy(sourceRelativePath: "skills/x", destinationPath: $0)
+                },
+                cronJobs: [],
+                memoryAppendix: nil,
+                memoryPath: ServerContext.local.paths.memoryMD,
+                projectRegistryName: "Example",
+                configSchema: nil,
+                configValues: [:],
+                manifestCachePath: nil
+            )
+        }
+        let ns = "/home/u/.hermes/skills/templates/example"
+
+        // Two skills, five files: two events, not five — and not the three
+        // the manifest happens to declare.
+        let two = plan(
+            namespaceDir: ns,
+            files: [
+                ns + "/alpha/SKILL.md",
+                ns + "/alpha/scripts/run.sh",
+                ns + "/beta/SKILL.md",
+                ns + "/beta/a.md",
+                ns + "/beta/b.md",
+            ],
+            declared: ["alpha", "beta", "gamma"]
+        )
+        #expect(TemplateInstallerViewModel.installedSkillCount(plan: two) == 2)
+
+        // A skill-less template writes nothing, however the manifest reads.
+        let none = plan(namespaceDir: nil, files: [], declared: ["alpha"])
+        #expect(TemplateInstallerViewModel.installedSkillCount(plan: none) == 0)
+
+        // Trailing slash on the namespace dir, and a stray copy outside it,
+        // must not manufacture a count.
+        let odd = plan(
+            namespaceDir: ns + "/",
+            files: [ns + "/alpha/SKILL.md", "/somewhere/else/SKILL.md"],
+            declared: nil
+        )
+        #expect(TemplateInstallerViewModel.installedSkillCount(plan: odd) == 1)
+    }
+
+    @Test("server_count_bucket covers the taxonomy's four buckets")
+    func serverCountBuckets() {
+        #expect(Analytics.serverCountBucket(-1) == "0")
+        #expect(Analytics.serverCountBucket(0) == "0")
+        #expect(Analytics.serverCountBucket(1) == "1")
+        #expect(Analytics.serverCountBucket(2) == "2_5")
+        #expect(Analytics.serverCountBucket(5) == "2_5")
+        #expect(Analytics.serverCountBucket(6) == "gt_5")
+        #expect(Analytics.serverCountBucket(999) == "gt_5")
+    }
+}
+
+}
+
+/// The `section_viewed` half of Phase 5, lifted OUT of
+/// `AnalyticsConnectionEventsTests` in round-5 P48 and deliberately NOT
+/// `.serialized`.
+///
+/// These tests used to install a `CapturingUsageTracker` into
+/// `Analytics.install(_:)` — a process-global slot — which made them
+/// serial-only twice over: two suites installing at once clobber each other,
+/// and any other test that builds an `AppCoordinator`
+/// (`CronViewAccessibilityTreeTests:92`, `SidebarRestructureTests:119`/`:137`)
+/// emits `section_viewed` into whatever happens to be installed. The
+/// coordinator takes its tracker as a parameter now, so each test here owns
+/// its own and nothing else in the process can reach it.
+///
+/// The three tests still in the serialized suite are the ones whose SUBJECT
+/// is the process seam itself (`Analytics.install` / `Analytics.recordOnce`);
+/// those are serial for a real reason and stay there.
+@Suite("Analytics section_viewed")
+struct AnalyticsSectionViewedTests {
+
+    /// The `section` tokens of every `section_viewed` event emitted so far,
+    /// in order.
+    private static func sections(_ tracker: CapturingUsageTracker) -> [String] {
+        tracker.captured.filter { $0.name == "section_viewed" }.compactMap { $0.props["section"] }
+    }
+
+
+    @Test("visiting the same section twice only records once")
+    @MainActor
+    func sameSectionDedupes() {
+        let tracker = CapturingUsageTracker()
+        let coordinator = AppCoordinator(usageTracker: tracker)
+        // The initializer itself counts as the first visit (every window
+        // starts on .dashboard, and a property initializer's default value
+        // never runs `didSet`).
+        #expect(Self.sections(tracker) == ["dashboard"])
+
+        coordinator.selectedSection = .chat
+        #expect(Self.sections(tracker) == ["dashboard", "chat"])
+
+        // Revisit .chat, then re-select .dashboard: neither is a NEW
+        // section, so nothing more is emitted.
+        coordinator.selectedSection = .settings
+        coordinator.selectedSection = .chat
+        coordinator.selectedSection = .dashboard
+        #expect(Self.sections(tracker) == ["dashboard", "chat", "settings"])
+    }
+
+    @Test("visiting two different sections records both")
+    @MainActor
+    func differentSectionsBothRecord() {
+        let tracker = CapturingUsageTracker()
+        let coordinator = AppCoordinator(usageTracker: tracker)
+        coordinator.selectedSection = .insights
+        coordinator.selectedSection = .kanban
+        #expect(Self.sections(tracker) == ["dashboard", "insights", "kanban"])
+    }
+
+    /// The regression the audit caught: the dedupe used to be an instance
+    /// property, but `AppCoordinator` is per-window and is rebuilt on every
+    /// server/profile switch, and each new one re-reports `.dashboard` from
+    /// `init`. A second coordinator must emit nothing it has already seen.
+    @Test("a second coordinator (new window or server switch) re-reports nothing")
+    @MainActor
+    func dedupeIsProcessWideAcrossCoordinators() {
+        let tracker = CapturingUsageTracker()
+        let first = AppCoordinator(usageTracker: tracker)
+        first.selectedSection = .logs
+        #expect(Self.sections(tracker) == ["dashboard", "logs"])
+
+        // A brand-new window / post-switch coordinator: its `init` re-selects
+        // .dashboard and the user walks back to Logs. Both are already-seen
+        // facts, so nothing new is emitted.
+        let second = AppCoordinator(usageTracker: tracker)
+        second.selectedSection = .logs
+        #expect(Self.sections(tracker) == ["dashboard", "logs"])
+
+        // A genuinely new section still records, from either coordinator.
+        second.selectedSection = .cron
+        #expect(Self.sections(tracker) == ["dashboard", "logs", "cron"])
+    }
+
+}

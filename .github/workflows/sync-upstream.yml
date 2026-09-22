@@ -1,0 +1,97 @@
+name: Sync upstream scarf
+
+on:
+  schedule:
+    - cron: '0 22 * * *'   # daily 22:00 UTC = 06:00 CST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout our main (full history for merge)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/awizemann/scarf.git
+
+      - name: Fetch upstream
+        run: git fetch upstream main --tags
+
+      - name: Check for divergence
+        id: check
+        run: |
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          MERGE_BASE=$(git merge-base HEAD upstream/main)
+          echo "upstream=$UPSTREAM_HEAD local=$LOCAL_HEAD base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+
+          if [ "$LOCAL_HEAD" = "$UPSTREAM_HEAD" ]; then
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+          elif [ "$MERGE_BASE" = "$LOCAL_HEAD" ]; then
+            echo "status=ff" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=diverged" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fast-forward main to upstream
+        if: steps.check.outputs.status == 'ff'
+        run: |
+          git merge --ff-only upstream/main
+          git push origin main
+          echo "pushed" >> "$GITHUB_OUTPUT"
+
+      - name: Mirror upstream release tags
+        if: steps.check.outputs.status != 'diverged'
+        run: |
+          for tag in $(git tag --list 'v*' --merged upstream/main); do
+            if ! git ls-remote --tags origin | grep -q "refs/tags/${tag}$"; then
+              git push origin "refs/tags/$tag"
+              echo "pushed tag $tag"
+            fi
+          done
+
+      - name: Open issue on divergence
+        if: steps.check.outputs.status == 'diverged'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-diverged'
+            });
+            if (issues.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: '⚠️ Upstream diverged — manual rebase required',
+                labels: ['upstream-diverged'],
+                body: [
+                  'Our `main` has commits not in upstream `awizemann/scarf`.',
+                  'Auto fast-forward is disabled until resolved.',
+                  '',
+                  `- upstream/main: ${{ steps.check.outputs.upstream }}`,
+                  `- our main: ${{ steps.check.outputs.local }}`,
+                  `- merge base: ${{ steps.check.outputs['merge_base'] }}`,
+                  '',
+                  '**Resolution:** rebase our custom commits onto upstream/main, force-push, close this issue.'
+                ].join('\n')
+              });
+            }
+
+      - name: Summary
+        run: |
+          {
+            echo "### Upstream sync"
+            echo "- status: ${{ steps.check.outputs.status }}"
+            echo "- upstream: awizemann/scarf @ ${{ steps.check.outputs.upstream }}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,462 @@
+import SwiftUI
+import ScarfCore
+
+/// Auxiliary tab — the 8 sub-model tasks hermes delegates to cheaper models.
+/// Each follows the same provider/model/base_url/api_key/timeout pattern.
+///
+/// Adds a per-task **Route through Nous Portal** toggle for Hermes v0.10.0+
+/// subscribers. The toggle flips `auxiliary.<task>.provider` between `nous`
+/// (subscription-routed) and `auto` (inherit main provider) — Hermes derives
+/// the gateway routing from that single field; there is no separate
+/// `use_gateway` key to write.
+///
+/// v0.12 dropped the `flush_memories` aux task on the server side and
+/// added `curator` (the autonomous skill-maintenance review fork). The
+/// Curator row only appears when `HermesCapabilities.hasCuratorAux` is
+/// set; the Flush Memories row only appears when
+/// `HermesCapabilities.hasFlushMemoriesAux` is set (inverse semantics —
+/// `true` only on pre-v0.12 hosts where the task still exists). v0.11
+/// users keep their edit surface; v0.12 users never see it.
+struct AuxiliaryTab: View {
+    @Bindable var viewModel: SettingsViewModel
+
+    @Environment(\.serverContext) private var serverContext
+    @Environment(\.hermesCapabilities) private var capabilitiesStore
+    private var capabilities: HermesCapabilities { capabilitiesStore?.capabilities ?? .empty }
+    @State private var subscription: NousSubscriptionState = .absent
+    @State private var showNousSignIn: Bool = false
+
+    /// Read `auth.json` off the main actor (C10) and hand back the small
+    /// value type. Both call sites — the view-load `.task` and the sign-in
+    /// sheet's completion — go through this one function so neither can drift
+    /// back onto a main-actor `readFile`.
+    ///
+    /// ``OffPool/run(_:)``, not `Task { }` and not `Task.detached`: this view
+    /// is main-actor isolated, so an unstructured `Task` would inherit that
+    /// isolation and run the SSH read on it anyway — the trap
+    /// `PlatformSetupHelpers.detached` documents. `Task.detached` clears the
+    /// isolation but not the COOPERATIVE POOL, and `loadState()` blocks its
+    /// thread on an SSH `readFile` (round-5 P52).
+    private static func loadSubscription(
+        _ context: ServerContext
+    ) async -> NousSubscriptionState {
+        let service = NousSubscriptionService(context: context)
+        return await OffPool.run { service.loadState() }
+    }
+
+    // Keyed by the config path name — matches `auxiliary.<task>.*` in config.yaml.
+    // Static base list; version-conditional rows (`web_extract`, `curator`,
+    // `flush_memories`) are spliced in at render time when the target Hermes
+    // supports them.
+    //
+    // `web_extract` is NOT here: the `auxiliary.web_extract.*` block was
+    // deleted upstream at v2026.8.27 (0.20.6) when web_extract stopped using
+    // an auxiliary LLM (pages are truncate-and-stored behind a read_file
+    // pointer). It is re-inserted right after `vision` — its historical
+    // position, so pre-v0.20.6 hosts render exactly as before — when
+    // `hasWebExtractAux` says the host still reads it.
+    private let baseTasks: [(key: String, title: LocalizedStringKey, icon: String)] = [
+        ("vision", "Vision", "eye"),
+        ("compression", "Compression", "arrow.down.right.and.arrow.up.left.circle"),
+        ("session_search", "Session Search", "magnifyingglass"),
+        ("skills_hub", "Skills Hub", "books.vertical"),
+        ("approval", "Approval", "checkmark.seal"),
+        ("mcp", "MCP", "puzzlepiece")
+    ]
+
+    private var tasks: [(key: String, title: LocalizedStringKey, icon: String)] {
+        var t = baseTasks
+        // Pre-v0.20.6 hosts only — restored at index 1 (right after Vision),
+        // its position before the upstream block was deleted, so those hosts
+        // render byte-identically to previous Scarf builds.
+        if capabilitiesStore?.capabilities.hasWebExtractAux ?? false {
+            t.insert(("web_extract", "Web Extract", "doc.richtext"), at: 1)
+        }
+        if capabilitiesStore?.capabilities.hasFlushMemoriesAux ?? false {
+            t.append(("flush_memories", "Flush Memories", "trash.slash"))
+        }
+        if capabilitiesStore?.capabilities.hasCuratorAux ?? false {
+            t.append(("curator", "Curator", "sparkles"))
+        }
+        return t
+    }
+
+    /// Aux task keys present in `config.yaml` but NOT in `tasks` —
+    /// e.g. `auxiliary.summarization.provider` from older Hermes
+    /// versions, or experimental tasks the user added by hand.
+    /// Without surfacing these, a user whose config has
+    /// `auxiliary.summarization.provider: nous` (where nous is no
+    /// longer authenticated) sees the "5 toggles all off" Aux
+    /// Models tab and concludes nothing's set — but Hermes
+    /// crashes because it's still resolving the unknown task to
+    /// a missing provider. Now those tasks render in a
+    /// fall-through "Other tasks in config.yaml" section.
+    private var unknownTasks: [String] {
+        let known = Set(tasks.map(\.key))
+        let found = Self.parseAuxTaskNames(from: viewModel.rawConfigYAML)
+        return found.subtracting(known).sorted()
+    }
+
+    /// Walk the raw config.yaml for the top-level `auxiliary:` block
+    /// and collect ONLY direct-child task names (not the leaf
+    /// fields underneath them like `provider`, `model`, `api_key`).
+    /// Static + `internal` so unit tests can drive it with fixture
+    /// strings without standing up a SettingsViewModel.
+    ///
+    /// Handles both 2-space and 4-space indent styles. Tolerates
+    /// blank lines and comments. Stops collecting when indent
+    /// drops back to or below the `auxiliary:` line — same shape
+    /// the YAML parser uses to decide block boundaries.
+    static func parseAuxTaskNames(from yaml: String) -> Set<String> {
+        var found: Set<String> = []
+        var inAuxBlock = false
+        var auxIndent = -1
+        // Indent of the first task-name line we see inside the
+        // block. Established lazily so we work with both 2- and
+        // 4-space indentation. Once locked, only collect at this
+        // exact indent — anything deeper is a leaf field.
+        var taskIndent = -1
+        for rawLine in yaml.components(separatedBy: "\n") {
+            // Strip line-trailing CRs (Windows / SSH artifacts).
+            let line = rawLine.hasSuffix("\r") ? String(rawLine.dropLast()) : rawLine
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+            let indent = line.count - trimmed.count
+            // Skip blanks + comments without resetting state.
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            if !inAuxBlock {
+                if trimmed.hasPrefix("auxiliary:") {
+                    inAuxBlock = true
+                    auxIndent = indent
+                    taskIndent = -1
+                }
+                continue
+            }
+            // Out of the aux block when indent drops back to or
+            // below auxIndent on a non-comment / non-blank line.
+            if indent <= auxIndent {
+                inAuxBlock = false
+                taskIndent = -1
+                continue
+            }
+            // First nested line inside the block: that indent
+            // level is the task-name level for the rest of this
+            // block.
+            if taskIndent == -1 {
+                taskIndent = indent
+            }
+            // Skip leaf fields — they live at indent > taskIndent.
+            guard indent == taskIndent else { continue }
+            // The line should look like `<key>:` or `<key>: <inline>`.
+            // Match `<identifier>:` at the start to filter out
+            // things like flow-style maps `[a, b]:` that aren't
+            // task definitions.
+            guard let colonIdx = trimmed.firstIndex(of: ":") else { continue }
+            let key = trimmed[..<colonIdx].trimmingCharacters(in: .whitespaces)
+            if !key.isEmpty,
+               key.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) {
+                found.insert(key)
+            }
+        }
+        return found
+    }
+
+    var body: some View {
+        Text("Auxiliary tasks use separate, typically cheaper models. Leave Provider as `auto` to inherit the main provider.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.bottom, 4)
+
+        ForEach(tasks, id: \.key) { task in
+            SettingsSection(title: task.title, icon: task.icon) {
+                auxRows(for: task.key)
+            }
+        }
+        // Title generation (auxiliary.title_generation) — the sub-model
+        // task that names new chat sessions. Ungated: the base block
+        // predates version tracking. Only the `language` row is v0.18+.
+        SettingsSection(title: "Title Generation", icon: "text.quote") {
+            titleGenerationRows
+        }
+        // -- Hermes v0.13 additions ---------------------------------
+        // Image-gen model picker. Hermes v0.13 honors `image_gen.model`
+        // as a top-level YAML key; pre-v0.13 hosts ignore it silently.
+        // Hide the section on pre-v0.13 hosts to spare users a
+        // "I set this and nothing happened" trap.
+        if capabilitiesStore?.capabilities.hasImageGenModel ?? false {
+            SettingsSection(title: "Image Generation", icon: "photo") {
+                imageGenRow
+            }
+        }
+        // OpenRouter response caching toggle (v0.13+). Same hide-on-
+        // pre-v0.13 rationale: the toggle no-ops on older Hermes hosts.
+        if capabilitiesStore?.capabilities.hasOpenRouterResponseCache ?? false {
+            SettingsSection(title: "OpenRouter", icon: "shippingbox") {
+                openRouterResponseCacheRow
+            }
+        }
+        // Unknown / unrecognised aux tasks present in config.yaml.
+        // Shown only when at least one such key is present so the
+        // typical user with a clean config never sees this section.
+        if !unknownTasks.isEmpty {
+            SettingsSection(title: "Other tasks in config.yaml", icon: "questionmark.folder") {
+                Text("These auxiliary tasks are present in your `config.yaml` but Scarf doesn't have a typed editor for them. The most common fix is to reset their provider to `auto` so Hermes inherits the main provider. For finer edits, use **Open in Editor** at the top of Settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 4)
+                ForEach(unknownTasks, id: \.self) { key in
+                    HStack(spacing: 8) {
+                        Image(systemName: "circle.dotted")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(key)
+                                .font(.system(.body, design: .monospaced, weight: .medium))
+                            Text("Configured under `auxiliary.\(key)` in config.yaml")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                        // The single most-actionable fix: reset
+                        // provider to `auto`. Solves the v2.7
+                        // user-reported case where removing a
+                        // provider's OAuth left an aux task
+                        // pointing at the now-unauthenticated
+                        // provider, blocking session start with an
+                        // opaque ACP -32603 internal error.
+                        Button("Reset provider") {
+                            viewModel.setAuxiliary(key, field: "provider", value: "auto")
+                        }
+                        .controlSize(.small)
+                        .help(Text("Sets `auxiliary.\(key).provider: auto` so Hermes inherits the main provider's authentication."))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.quaternary.opacity(0.3))
+                }
+            }
+        }
+        Color.clear.frame(height: 0)
+            // C10. `NousSubscriptionService.loadState()` is a `readFile` of
+            // `auth.json` through the CONTEXT's transport — a local read on a
+            // local server, a full SSH round trip on a remote one, and it was
+            // running synchronously on the main actor from `onAppear`. The
+            // shape is `ModelPickerSheet`'s: an `OffPool.run` hop whose
+            // result is a small `Sendable` value assigned back on the main
+            // actor. `.task` rather than `.onAppear` for the reason the
+            // "Prefer .task over .onAppear" note gives — it fires once per
+            // view instance and cancels on disappear, where `onAppear`
+            // re-fires the remote read on every re-entry into this tab.
+            .task {
+                subscription = await Self.loadSubscription(serverContext)
+            }
+            .sheet(isPresented: $showNousSignIn) {
+                NousSignInSheet {
+                    // The idle twin: the same synchronous read, on the sheet's
+                    // completion. Refreshing after a sign-in is exactly when
+                    // the token round trip is slowest.
+                    Task { subscription = await Self.loadSubscription(serverContext) }
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func auxRows(for key: String) -> some View {
+        let model = auxModel(for: key)
+        nousGatewayToggle(for: key, currentProvider: model.provider)
+        EditableTextField(label: "Provider", value: model.provider) { viewModel.setAuxiliary(key, field: "provider", value: $0) }
+        EditableTextField(label: "Model", value: model.model) { viewModel.setAuxiliary(key, field: "model", value: $0) }
+        EditableTextField(label: "Base URL", value: model.baseURL) { viewModel.setAuxiliary(key, field: "base_url", value: $0) }
+        SecretTextField(label: "API Key", value: model.apiKey) { viewModel.setAuxiliary(key, field: "api_key", value: $0) }
+        StepperRow(label: "Timeout (s)", value: model.timeout, range: 5...3600, step: 5) { viewModel.setAuxiliaryTimeout(key, value: $0) }
+        if capabilitiesStore?.capabilities.hasAuxiliaryReasoningEffort ?? false {
+            reasoningEffortPicker(value: model.reasoningEffort) { viewModel.setAuxiliaryReasoningEffort(key, value: $0) }
+        }
+        // v0.20.4+ — documented only for `compression`.
+        if key == "compression", capabilitiesStore?.capabilities.isV0204OrLater ?? false {
+            maxConcurrencyRow(value: model.maxConcurrency) { viewModel.setAuxiliaryMaxConcurrency(key, value: $0, stored: model.maxConcurrency, capabilities: capabilities) }
+        }
+    }
+
+    /// Shared "max concurrency" row for the v0.20.4+ true-optional
+    /// `auxiliary.<task>.max_concurrency` cap. `0` in the stepper means
+    /// "unlimited" (unsets the key); any positive value writes it.
+    @ViewBuilder
+    private func maxConcurrencyRow(value: Int?, onChange: @escaping (Int?) -> Void) -> some View {
+        StepperRow(label: "Max Concurrency", value: value ?? 0, range: 0...50, step: 1) { newValue in
+            onChange(newValue == 0 ? nil : newValue)
+        }
+        .help("Caps simultaneous calls for this task to reduce request-burst 429s during provider incidents. 0 = unlimited (legacy behavior).")
+    }
+
+    /// Shared reasoning-effort picker for `auxiliary.<task>.reasoning_effort`
+    /// (v0.19+) — "Default" writes an empty scalar (provider default); the
+    /// other options come from ``HermesReasoningEffort/levels(capabilities:)``,
+    /// the ONE vocabulary, whose per-level floors P35 walked
+    /// (`hermes_constants.VALID_REASONING_EFFORTS` gains `max` at v2026.7.7 =
+    /// 0.18.1 and `ultra` at v2026.7.20 = 0.19.0).
+    ///
+    /// P37 finding 6: this used to build its options from a second,
+    /// hard-coded enum (`AuxiliaryReasoningEffort`, now retired) whose doc
+    /// still credited "v0.20.0" for both additions. The narrowing is moot on
+    /// every host that renders this row — `hasAuxiliaryReasoningEffort` is
+    /// itself 0.19.0, the tag that added `ultra` — but expressing it through
+    /// the shared source is what stops the two lists drifting again.
+    ///
+    /// Round-4 decision 13: the options are widened to the stored value so a
+    /// hand-edited level never renders a blank control, with
+    /// ``UnsupportedEffortNote`` beneath saying what the host does with it.
+    /// Moot here for the same reason the narrowing is — but the three
+    /// pickers now answer this question in ONE place, which is the point.
+    @ViewBuilder
+    private func reasoningEffortPicker(value: String, onChange: @escaping (String) -> Void) -> some View {
+        PickerRow(
+            label: "Reasoning Effort",
+            // P46b: normalise at the SELECTION. A whitespace-only stored
+            // value is the sentinel to `levels(…)`, which widens nothing —
+            // so handing the picker the raw `"  "` left it with no matching
+            // tag and a blank control.
+            selection: HermesReasoningEffort.pickerSelection(for: value),
+            options: [""] + HermesReasoningEffort.levels(
+                capabilities: capabilities,
+                selected: value
+            ),
+            // The sentinel row here is NOT the same claim as AgentTab's, and
+            // the difference is walked. An empty `agent.reasoning_effort`
+            // RESOLVES to Hermes's own `medium`
+            // (`agent/transports/chat_completions.py:420-422` @ `v2026.9.7`),
+            // which is why that row reads "Hermes default". An empty
+            // `auxiliary.<task>.reasoning_effort` resolves to NOTHING:
+            // `_get_task_extra_body` returns early on `effort is None or
+            // effort == ""` (`agent/auxiliary_client.py:5700-5702`), so no
+            // `reasoning` key is put in the aux call's `extra_body` at all
+            // and the provider's own default stands. It does not inherit the
+            // global row either — `_get_auxiliary_task_config` (`:5583-5605`)
+            // reads `auxiliary.<task>` plus a plugin's declared defaults, and
+            // never `agent.*`. "Default" is the honest word for a row whose
+            // fallback Scarf cannot name.
+            optionLabel: { $0.isEmpty ? String(localized: "Default") : $0.capitalized },
+            onChange: onChange
+        )
+        UnsupportedEffortNote(selected: value, capabilities: capabilities)
+    }
+
+    /// `auxiliary.title_generation` rows. Distinct from `auxRows` because
+    /// this task carries two extra fields (`enabled`, `language`) that no
+    /// other auxiliary task has.
+    @ViewBuilder
+    private var titleGenerationRows: some View {
+        let settings = viewModel.config.auxiliary.titleGeneration
+        ToggleRow(label: "Enabled", isOn: settings.enabled) { viewModel.setTitleGenerationEnabled($0) }
+        EditableTextField(label: "Provider", value: settings.provider) { viewModel.setTitleGeneration(field: "provider", value: $0) }
+        EditableTextField(label: "Model", value: settings.model) { viewModel.setTitleGeneration(field: "model", value: $0) }
+        EditableTextField(label: "Base URL", value: settings.baseURL) { viewModel.setTitleGeneration(field: "base_url", value: $0) }
+        SecretTextField(label: "API Key", value: settings.apiKey) { viewModel.setTitleGeneration(field: "api_key", value: $0) }
+        StepperRow(label: "Timeout (s)", value: settings.timeout, range: 5...3600, step: 5) { viewModel.setTitleGenerationTimeout($0) }
+        if capabilitiesStore?.capabilities.hasAuxiliaryReasoningEffort ?? false {
+            reasoningEffortPicker(value: settings.reasoningEffort) { viewModel.setTitleGenerationReasoningEffort($0) }
+        }
+        if capabilitiesStore?.capabilities.hasTitleGenerationLanguage ?? false {
+            EditableTextField(label: "Language", value: settings.language) { viewModel.setTitleGenerationLanguage($0) }
+            Text("Force generated titles into this language (e.g. `en`, `ja`) regardless of the chat's own language. Leave blank to match the chat.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 4)
+        }
+        if capabilitiesStore?.capabilities.isV0204OrLater ?? false {
+            maxConcurrencyRow(value: settings.maxConcurrency) { viewModel.setTitleGenerationMaxConcurrency($0, capabilities: capabilities) }
+        }
+    }
+
+    @ViewBuilder
+    private func nousGatewayToggle(for key: String, currentProvider: String) -> some View {
+        let isOn = (currentProvider == "nous")
+        ToggleRow(label: "Nous Portal", isOn: isOn) { wantsOn in
+            // "nous" enables subscription routing; "auto" reverts to the
+            // inherit-main-provider default. We never touch model/base/key
+            // fields here — Hermes reuses them if the user switches back.
+            viewModel.setAuxiliary(key, field: "provider", value: wantsOn ? "nous" : "auto")
+        }
+        if !subscription.present && !isOn {
+            HStack(spacing: 8) {
+                Text("Requires an active Nous Portal subscription.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Button("Sign in first") { showNousSignIn = true }
+                    .controlSize(.mini)
+                    .buttonStyle(.borderedProminent)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 4)
+        }
+    }
+
+    // MARK: - v0.13 surfaces
+
+    /// Image-gen model picker — curated allowlist + free-form custom
+    /// entry. Capability-gated by the caller; this view assumes the
+    /// host honors `image_gen.model` (Hermes v0.13+).
+    @ViewBuilder
+    private var imageGenRow: some View {
+        let value = viewModel.config.imageGenModel
+        Picker("Model", selection: Binding(
+            get: { value },
+            set: { viewModel.setImageGenModel($0) }
+        )) {
+            Text("Hermes default").tag("")
+            Divider()
+            ForEach(ModelCatalogService.imageGenModels) { model in
+                Text(model.display).tag(model.modelID)
+            }
+            // User has set a custom value not in the curated list;
+            // preserve it as a tagged option so the picker renders the
+            // actual selection rather than collapsing to "Hermes
+            // default".
+            if !value.isEmpty
+                && !ModelCatalogService.imageGenModels.contains(where: { $0.modelID == value }) {
+                Divider()
+                Text(value + "  (custom)").tag(value)
+            }
+        }
+        .pickerStyle(.menu)
+        EditableTextField(label: "Custom model ID", value: value) { newValue in
+            viewModel.setImageGenModel(newValue.trimmingCharacters(in: .whitespaces))
+        }
+        Text("Used for image generation calls. Leave as Hermes default unless your provider documents a specific model ID for image-gen.")
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 4)
+    }
+
+    /// OpenRouter response-caching toggle (Hermes v0.13+). Off by
+    /// default; surfaced for users with highly repeated prompts who
+    /// want OpenRouter to cache identical-prompt responses.
+    @ViewBuilder
+    private var openRouterResponseCacheRow: some View {
+        let isOn = viewModel.config.openrouterResponseCacheEnabled
+        ToggleRow(label: "Response caching", isOn: isOn) { newValue in
+            viewModel.setOpenRouterResponseCache(newValue)
+        }
+        Text("OpenRouter caches identical prompts within a session to reduce token costs. Off by default — enable when your workload has highly repeated prompts.")
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 4)
+    }
+
+    private func auxModel(for key: String) -> AuxiliaryModel {
+        switch key {
+        case "vision": return viewModel.config.auxiliary.vision
+        case "web_extract": return viewModel.config.auxiliary.webExtract
+        case "compression": return viewModel.config.auxiliary.compression
+        case "session_search": return viewModel.config.auxiliary.sessionSearch
+        case "skills_hub": return viewModel.config.auxiliary.skillsHub
+        case "approval": return viewModel.config.auxiliary.approval
+        case "mcp": return viewModel.config.auxiliary.mcp
+        case "flush_memories": return viewModel.config.auxiliary.flushMemories
+        case "curator": return viewModel.config.auxiliary.curator
+        default: return .empty
+        }
+    }
+}

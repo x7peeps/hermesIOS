@@ -1,0 +1,154 @@
+import Foundation
+
+/// Typed errors surfaced by `ServerTransport` implementations. The UI
+/// distinguishes these so user-visible messages can be specific
+/// ("authentication failed" vs. "command failed") without having to grep
+/// stderr strings.
+public enum TransportError: LocalizedError {
+    /// `ssh`/`scp` could not reach the host or hit a protocol-level issue
+    /// (name resolution, connection refused, route error).
+    case hostUnreachable(host: String, stderr: String)
+    /// Remote rejected our credentials. Typically means no ssh-agent key is
+    /// loaded, or the loaded keys don't match any `authorized_keys` entry.
+    case authenticationFailed(host: String, stderr: String)
+    /// Remote `~/.ssh/known_hosts` fingerprint no longer matches. Blocking —
+    /// we never auto-accept on mismatch.
+    case hostKeyMismatch(host: String, stderr: String)
+    /// The command ran on the remote but exited non-zero.
+    case commandFailed(exitCode: Int32, stderr: String)
+    /// Local filesystem operation failed (read/write/stat) with the OS error
+    /// message attached.
+    case fileIO(path: String, underlying: String)
+    /// Timed out waiting for a process to finish. `partialStdout` carries
+    /// whatever output was captured before the timer fired.
+    case timeout(seconds: TimeInterval, partialStdout: Data)
+    /// The per-host connection circuit breaker is open (gh#138): repeated
+    /// connection failures paused outbound attempts to this host until
+    /// `retryAt`. No ssh process was spawned for this call.
+    case circuitOpen(host: String, retryAt: Date)
+    /// Something we didn't plan for. Fall-through bucket with enough context
+    /// for a bug report.
+    case other(message: String)
+
+    /// True when this error is the OS saying the path is not there, as
+    /// opposed to the channel saying it could not ask (GW-F6 / audit DI L1).
+    ///
+    /// The distinction matters because `GuardedJSONStore.inspect` otherwise
+    /// proves absence by DOUBLE NEGATIVE — a failed read plus a failed
+    /// `stat` — and over one SSH channel those two failures are correlated:
+    /// the blip that killed the read kills the stat a moment later, and the
+    /// caller is told "provably absent" about a file that is provably
+    /// nothing of the sort. An ENOENT is a positive answer from the far end,
+    /// so it needs no second opinion.
+    ///
+    /// Matched on the message because that is what survives both transports:
+    /// `SSHTransport` normalizes the remote stderr to this exact phrase, and
+    /// `LocalTransport` maps `CocoaError.fileReadNoSuchFile` onto it. Any
+    /// other failure — permissions, a dropped channel, a timeout — is
+    /// deliberately NOT this, and falls through to the stat probe unchanged.
+    public var isNoSuchFile: Bool {
+        guard case .fileIO(_, let underlying) = self else { return false }
+        return underlying.contains("No such file")
+    }
+
+    public var errorDescription: String? {
+        switch self {
+        case .hostUnreachable(let host, _):
+            return "Can't reach \(host). Check the hostname, network, and SSH config."
+        case .authenticationFailed(let host, _):
+            return "SSH authentication to \(host) failed. Ensure your key is loaded in ssh-agent."
+        case .hostKeyMismatch(let host, _):
+            return "Host key for \(host) has changed. Inspect ~/.ssh/known_hosts before continuing."
+        case .commandFailed(let code, let stderr):
+            // Trim stderr to a single line for the summary; full text is in
+            // the associated value for disclosure views.
+            let firstLine = stderr.split(separator: "\n").first.map(String.init) ?? ""
+            return "Remote command exited \(code). \(firstLine)"
+        case .fileIO(let path, let msg):
+            return "File I/O failed at \(path): \(msg)"
+        case .timeout(let secs, _):
+            return "Command timed out after \(Int(secs))s."
+        case .circuitOpen(let host, let retryAt):
+            let secs = max(0, Int(retryAt.timeIntervalSinceNow))
+            return "Connection to \(host) is paused after repeated failures. Retrying in \(secs)s."
+        case .other(let msg):
+            return msg
+        }
+    }
+
+    /// Full stderr (if any) for display in a disclosure view. Empty string
+    /// when there's no additional detail worth showing.
+    public var diagnosticStderr: String {
+        switch self {
+        case .hostUnreachable(_, let s),
+             .authenticationFailed(_, let s),
+             .hostKeyMismatch(_, let s),
+             .commandFailed(_, let s):
+            return s
+        default:
+            return ""
+        }
+    }
+
+    /// What a ``timeout(seconds:partialStdout:)`` captured from stdout before
+    /// the kill landed, decoded as UTF-8. Empty for every other case.
+    ///
+    /// Deliberately NOT folded into ``diagnosticStderr``: that property is
+    /// rendered as *stderr* detail by every one of its callers (and handed to
+    /// `stderr:` parameters by some), and partial stdout is not stderr. The
+    /// one caller that needs it — `HermesFileService.runHermesCLI`, which
+    /// hands its output to a ``HermesCLIVerdict`` — asks for it by name.
+    ///
+    /// A timeout with output is a real shape: `_cmd_restart`'s no-service arm
+    /// prints `Starting gateway...` and then runs the gateway in the
+    /// FOREGROUND (`hermes_cli/gateway.py:6062-6066` @ v2026.9.7), so the run
+    /// only ever ends at Scarf's own timer. Discarding the partial stdout
+    /// there turned an "unconfirmed, gateway is coming up" into a flat
+    /// "restart failed".
+    public var partialStdoutText: String {
+        guard case .timeout(_, let data) = self else { return "" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Bounded, non-identifying token for the `error_kind` analytics prop.
+    ///
+    /// Deliberately derived from the *case*, never from an associated value:
+    /// every payload this enum carries (host, stderr, path) is user data and
+    /// must never reach a prop. Pairs with
+    /// `TransportError.classifySSHFailure`, which is what turns raw ssh
+    /// stderr into the case in the first place.
+    public var analyticsErrorKind: String {
+        switch self {
+        case .hostUnreachable:      return "host_unreachable"
+        case .authenticationFailed: return "auth_failed"
+        case .hostKeyMismatch:      return "host_key_mismatch"
+        case .commandFailed:        return "command_failed"
+        case .fileIO:               return "file_io"
+        case .timeout:              return "timeout"
+        case .circuitOpen:          return "circuit_open"
+        case .other:                return "other"
+        }
+    }
+
+    /// Heuristic classifier: convert the ssh/scp stderr of a failed command
+    /// into a specific `TransportError`. Used by `SSHTransport` after a
+    /// non-zero exit. Defaults to `.commandFailed` when no known marker
+    /// matches.
+    public static func classifySSHFailure(host: String, exitCode: Int32, stderr: String) -> TransportError {
+        let s = stderr.lowercased()
+        if s.contains("permission denied") || s.contains("authentication failed")
+            || s.contains("publickey") && s.contains("denied") {
+            return .authenticationFailed(host: host, stderr: stderr)
+        }
+        if s.contains("host key verification failed")
+            || s.contains("remote host identification has changed") {
+            return .hostKeyMismatch(host: host, stderr: stderr)
+        }
+        if s.contains("no route to host") || s.contains("connection refused")
+            || s.contains("connection timed out") || s.contains("could not resolve hostname")
+            || s.contains("connection closed by") && s.contains("port 22") {
+            return .hostUnreachable(host: host, stderr: stderr)
+        }
+        return .commandFailed(exitCode: exitCode, stderr: stderr)
+    }
+}
