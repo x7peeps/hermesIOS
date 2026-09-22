@@ -30,13 +30,16 @@ jobs:
         run: |
           UPSTREAM_HEAD=$(git rev-parse upstream/main)
           LOCAL_HEAD=$(git rev-parse HEAD)
-          MERGE_BASE=$(git merge-base HEAD upstream/main)
+          MERGE_BASE=$(git merge-base HEAD upstream/main || true)
           echo "upstream=$UPSTREAM_HEAD local=$LOCAL_HEAD base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
 
           if [ "$LOCAL_HEAD" = "$UPSTREAM_HEAD" ]; then
             echo "status=up-to-date" >> "$GITHUB_OUTPUT"
           elif [ "$MERGE_BASE" = "$LOCAL_HEAD" ]; then
             echo "status=ff" >> "$GITHUB_OUTPUT"
+          elif [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" = "$UPSTREAM_HEAD" ]; then
+            # Our maintenance commits sit on top of upstream head — healthy state.
+            echo "status=ahead-with-custom" >> "$GITHUB_OUTPUT"
           else
             echo "status=diverged" >> "$GITHUB_OUTPUT"
           fi
